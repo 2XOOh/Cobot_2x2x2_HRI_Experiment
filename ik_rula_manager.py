@@ -1,4 +1,4 @@
-#ik_rula_manager.py (물리 연산 엔진) 평가 지표에 포함된 'Elbow angle(팔꿈치 각도)' 값을 산출하여 리턴하도록 함수에 연산 로직을 추가
+# ik_rula_manager.py (물리 연산 엔진)
 import math
 from collections import deque
 
@@ -19,6 +19,7 @@ class RobotIKManager:
         self.H_shoulder_mm = h_shoulder_cm * 10
         self.L1 = l1_cm * 10
         self.L2 = l2_cm * 10
+        self.LINK0_HEIGHT_MM = 634.0
         
         self.prev_target_pass_floor_z_mm = None
         self.alpha_smoothing = 0.2  
@@ -34,7 +35,7 @@ class RobotIKManager:
         )
 
     def calculate_ik(self, lm_shoulder, lm_elbow, lm_wrist, control_type="llm"):
-        # 1. 어깨(겨드랑이) 각도 산출 로직
+        # 1. 어깨(겨드랑이) 각도 산출
         dy = lm_elbow.y - lm_shoulder.y
         dx = lm_elbow.x - lm_shoulder.x
         
@@ -47,7 +48,7 @@ class RobotIKManager:
         self.angle_window.append(armpit_deg)
         avg_sh_deg = sum(self.angle_window) / len(self.angle_window)
 
-        # 2. [추가] 매트릭스 지표 측정용 팔꿈치 각도 산출 (어깨-팔꿈치 벡터와 팔꿈치-손목 벡터 내적)
+        # 2. 매트릭스 지표용 팔꿈치 각도 산출 (3차원 벡터 내적)
         v1 = [lm_shoulder.x - lm_elbow.x, lm_shoulder.y - lm_elbow.y, lm_shoulder.z - lm_elbow.z]
         v2 = [lm_wrist.x - lm_elbow.x, lm_wrist.y - lm_elbow.y, lm_wrist.z - lm_elbow.z]
         dot = sum(a*b for a, b in zip(v1, v2))
@@ -76,7 +77,7 @@ class RobotIKManager:
                 self.current_pass_floor_z_mm + self.FIXED_ADJUST_MM
             )
         
-        # EMA 필터 적용
+        # 4. EMA 필터 적용
         if self.prev_target_pass_floor_z_mm is None:
             target_pass_floor_z_mm = raw_target_pass_floor_z_mm
         else:
@@ -86,9 +87,11 @@ class RobotIKManager:
                 self.prev_target_pass_floor_z_mm * (1.0 - self.alpha_smoothing)
             )
             
+        # 5. 로봇팔 하한선 강제 방어벽
+        if target_pass_floor_z_mm < self.LINK0_HEIGHT_MM:
+            target_pass_floor_z_mm = self.LINK0_HEIGHT_MM
+            
         self.prev_target_pass_floor_z_mm = target_pass_floor_z_mm
-        
         adj_mm = target_pass_floor_z_mm - self.current_pass_floor_z_mm
         
-        # 반환값에 elb_deg 추가
         return armpit_deg, avg_sh_deg, elb_deg, adj_mm, target_pass_floor_z_mm

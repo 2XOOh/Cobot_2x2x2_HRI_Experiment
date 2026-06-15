@@ -1,4 +1,4 @@
-#experiment_controller.py (실험 조건 제어 뇌) 프롬프트에 페르소나, 현재 상태, Min/Max 한계값, 번복 명령(최종 발화 추출) 처리 지침, Auto Chain-of-Thought (JSON thought 필드) 및 퓨샷(Few-shot) 예시 추가 
+# experiment_controller.py (실험 조건 제어 뇌)
 import json
 import re
 from datetime import datetime
@@ -25,7 +25,6 @@ class PickAndPlaceExperiment:
         lead = condition.get("lead", "시스템")          
         control = condition.get("control", "llm")       
 
-        # 최종 도달할 실제 로봇 좌표 Z값 계산 (link0 기준, meter 단위)
         current_z_m = round((current_pass_floor_z_mm - LINK0_HEIGHT_MM) / 1000, 3)
         calculated_target_z_m = round((target_pass_floor_z_mm - LINK0_HEIGHT_MM) / 1000, 3)
 
@@ -36,7 +35,6 @@ class PickAndPlaceExperiment:
             msg = f"[No-Intervention] 위험 각도({avg_sh_angle:.1f}도) 감지되었으나 비개입 조건이므로 최종 좌표 {final_z_m:.3f}m를 유지합니다."
         else:
             if control == "llm":
-                # LLM을 이용해 작업자 음성의 뉘앙스와 번복 명령을 심층 분석
                 response_json = self._analyze_intent_gpt(lead, avg_sh_angle, calculated_target_z_m, current_z_m, user_voice_text)
                 
                 if response_json:
@@ -49,7 +47,6 @@ class PickAndPlaceExperiment:
                     msg = "[LLM Error] 음성 분석 실패로 현재 위치를 유지합니다."
                     llm_metrics["is_invalid"] = True
             else:
-                # 룰베이스(Rule-Base) 기반 제어
                 llm_metrics["is_approved"] = is_approved_rule
                 if is_approved_rule:
                     final_z_m = calculated_target_z_m
@@ -58,12 +55,11 @@ class PickAndPlaceExperiment:
                     final_z_m = current_z_m
                     msg = f"[Rule-Base] 거절 수신. 현재 Z 좌표({final_z_m:.3f}m)를 유지합니다."
 
-        # JSON 패키지 빌드
         result_json = {
             "frame_id": "link0",
             "timestamp": timestamp_iso,
             "armpit_angle_deg": round(avg_sh_angle, 1), 
-            "elbow_angle_deg": round(elb_angle, 1), # 평가 매트릭스용 팔꿈치 각도 추가
+            "elbow_angle_deg": round(elb_angle, 1),
             "position": {
                 "x": 0.45,
                 "y": 0.00,
@@ -87,11 +83,10 @@ class PickAndPlaceExperiment:
         당신의 목표는 작업자의 음성 명령 의도를 정확히 파악하고(번복 명령 포함), 관절 한계값을 준수하여 최종 로봇 이동 좌표를 결정하는 것입니다.
 
         [로봇 및 환경 현재 상태 (State)]
-        - 작업자 현재 평균 겨드랑이 각도: {avg_sh_angle:.1f}도 (인간공학적 위험 임계치: 60도 초과 시 위험)
+        - 15초 구간 평균 겨드랑이 각도: {avg_sh_angle:.1f}도 (인간공학적 위험 임계치: 60도 초과 시 위험)
         - 현재 로봇의 Z 좌표: {current_z_m:.3f}m
         - 시스템이 계산한 안전 복귀용 추천 Z 좌표: {calculated_target_z_m:.3f}m
         - 로봇 Z축 이동 한계 (Min/Max): 최소 {MIN_Z_LIMIT_M}m ~ 최대 {MAX_Z_LIMIT_M}m (범위 밖 이동 시 실패 조건)
-        - 작업자 주도권: {lead}
         - 작업자 음성 명령: "{user_text if user_text else '음성 발화 없음(또는 시스템 주도)'}"
 
         [안전 기반 판단 및 의도 분석 지침 (Safety & Intent Rules)]
@@ -103,7 +98,7 @@ class PickAndPlaceExperiment:
         [생각 과정 (Auto Chain-of-Thought)]
         반드시 JSON 응답 내 "thought" 필드에 단계별 판단 논리(번복 여부 판단 -> 한계값 범위 체크 -> 최종 승인 결정)를 가장 먼저 작성하세요.
         
-        [출력 포맷 (오직 JSON만 출력, 마크다운 코드 블록 제외)]
+        [출력 포맷 (오직 JSON만 출력)]
         {{
             "thought": "판단 근거 작성",
             "is_approved": true 또는 false,
@@ -131,7 +126,6 @@ class PickAndPlaceExperiment:
                 temperature=0.1
             )
             raw_content = response.choices[0].message.content.strip()
-            # 마크다운 블록 제거 전처리
             raw_content = re.sub(r'^```json\s*', '', raw_content)
             raw_content = re.sub(r'\s*```$', '', raw_content)
             
