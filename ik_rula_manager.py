@@ -34,6 +34,20 @@ class RobotIKManager:
             + self.L2 * math.cos(math.radians(45))
         )
 
+    def calculate_rula_score(self, shoulder_angle_deg):
+        """
+        어깨(Upper Arm) 굴곡 각도 기반 단순화된 RULA 점수 산출
+        (기준: 0~20도 = 1점, 20~45도 = 2점, 45~90도 = 3점, 90도 이상 = 4점)
+        """
+        if shoulder_angle_deg <= 20.0:
+            return 1
+        elif 20.0 < shoulder_angle_deg <= 45.0:
+            return 2
+        elif 45.0 < shoulder_angle_deg <= 90.0:
+            return 3
+        else:
+            return 4
+
     def calculate_ik(self, lm_shoulder, lm_elbow, lm_wrist, control_type="llm"):
         # 1. 어깨(겨드랑이) 각도 산출
         dy = lm_elbow.y - lm_shoulder.y

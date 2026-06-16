@@ -43,7 +43,7 @@ CONDITIONS = {
 gripper_open_event = threading.Event()
 
 # =========================================================
-# 통신 및 음성 인터페이스 (기존 내용 완전 유지)
+# 통신 및 음성 인터페이스
 # =========================================================
 def indy7_socket_listener():
     HOST = '0.0.0.0' 
@@ -100,7 +100,7 @@ def listen_for_command():
             return ""
 
 def check_positive_keywords(text):
-    """(요구사항 3 유지) Rule-based 구체화된 긍정 판단 리스트"""
+    """Rule-based 구체화된 긍정 판단 리스트"""
     clean_text = text.replace(" ", "").strip()
     positive_keywords = ["응", "어", "네", "예", "조정", "그래", "해줘", "맞아", "오케이", "ok", "좋아", "이동"]
     return any(keyword in clean_text for keyword in positive_keywords)
@@ -134,7 +134,7 @@ def main():
     socket_thread = threading.Thread(target=indy7_socket_listener, daemon=True)
     socket_thread.start()
     
-    # 엑셀 매트릭스 연동 평가지표 유지
+    # 엑셀 매트릭스 평가지표 
     metrics = {
         "completed_transfers": 0,
         "robot_adjustment_count": 0,
@@ -142,7 +142,8 @@ def main():
         "correction_commands_count": 0,
         "invalid_failed_command_count": 0,
         "total_adjustment_magnitude_mm": 0.0,
-        "risky_posture_total_time_sec": 0.0
+        "risky_posture_total_time_sec": 0.0,
+        "total_rula_score": 0.0 # RULA 누적 점수 추가
     }
     cycle_durations = [] # 사이클당 소요시간 저장 배열
 
@@ -210,11 +211,9 @@ def main():
                 elapsed_task = time.time() - cycle_start_time
                 
                 if elapsed_task < 15.0:
-                    # 15초 동안 각도 지속 누적
                     if current_frame_sh_deg > 0:
                         cycle_angles.append(current_frame_sh_deg)
                     
-                    # 5초 대기 / 10초 점 세기 분할 UI 렌더링
                     if elapsed_task < 5.0:
                         phase_msg = "Phase 1: Stabilization Wait (5s)"
                         color = (0, 255, 255)
@@ -228,7 +227,12 @@ def main():
                 else:
                     # 15초 태스크 종료 -> 평균 계산 및 룰라 판단
                     final_avg_sh_angle = sum(cycle_angles) / len(cycle_angles) if cycle_angles else 0.0
-                    print(f"\n⏹ [15초 태스크 완료] 구간 내 평균 겨드랑이 굴곡 각도: {final_avg_sh_angle:.1f}도")
+                    
+                    # [추가] 이번 사이클의 RULA 어깨 상지 위험 점수 추출
+                    cycle_rula_score = ik_engine.calculate_rula_score(final_avg_sh_angle)
+                    metrics["total_rula_score"] += cycle_rula_score
+                    
+                    print(f"\n⏹ [15초 태스크 완료] 구간 평균 각도: {final_avg_sh_angle:.1f}도 | RULA 위험 점수: {cycle_rula_score}점")
                     
                     is_risky = (final_avg_sh_angle >= 60.0)
                     is_finally_approved = False
@@ -280,12 +284,14 @@ def main():
                     task_completion_time = time.time() - cycle_start_time
                     cycle_durations.append(task_completion_time)
                     
+                    # [추가] 상세 로그 JSON에 rula_score 필드 저장
                     log_data = {
                         "time": time.strftime('%Y-%m-%d %H:%M:%S'),
                         "condition": CURRENT_CONDITION["name"],
                         "cycle_index": metrics["completed_transfers"],
                         "task_completion_time_sec": round(task_completion_time, 2),
                         "avg_shoulder_angle": round(final_avg_sh_angle, 1),
+                        "rula_score": cycle_rula_score,
                         "is_risky": is_risky,
                         "is_approved": is_finally_approved
                     }
@@ -304,20 +310,23 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
 
-    # 10분 통계 매트릭스 CSV 누적 작성
+    # 10분 통계 매트릭스 CSV 누적 작성 (RULA 평균 점수 추가)
     avg_cycle_time = sum(cycle_durations) / len(cycle_durations) if cycle_durations else 0.0
+    avg_rula = metrics["total_rula_score"] / metrics["completed_transfers"] if metrics["completed_transfers"] > 0 else 0.0
+    
     print("\n" + "="*50)
     print(f"📊 [{CURRENT_CONDITION['name']}] 10분 실험 세션 종료")
     print(f" - 총 완료 블록 전달 횟수 (Transfers): {metrics['completed_transfers']} 회")
     print(f" - 평균 1사이클 소요 시간 (Task Completion Time): {avg_cycle_time:.2f} 초")
+    print(f" - 10분 구간 평균 RULA 점수: {avg_rula:.2f} 점")
     print("="*50)
     
     file_exists = os.path.isfile(SUMMARY_FILENAME)
     with open(SUMMARY_FILENAME, "a", encoding="utf-8") as f:
         if not file_exists:
-            f.write("Time,Condition,Duration(s),Transfers,Avg_Task_Completion_Time(s),Adjustments,Interventions,Correction_Cmds,Invalid_Cmds,Total_Adj_mm,Risky_Time(s)\n")
+            f.write("Time,Condition,Duration(s),Transfers,Avg_Task_Completion_Time(s),Avg_RULA_Score,Adjustments,Interventions,Correction_Cmds,Invalid_Cmds,Total_Adj_mm,Risky_Time(s)\n")
         f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{CURRENT_CONDITION['name']},{CONDITION_DURATION},"
-                f"{metrics['completed_transfers']},{avg_cycle_time:.2f},{metrics['robot_adjustment_count']},"
+                f"{metrics['completed_transfers']},{avg_cycle_time:.2f},{avg_rula:.2f},{metrics['robot_adjustment_count']},"
                 f"{metrics['system_intervention_count']},{metrics['correction_commands_count']},"
                 f"{metrics['invalid_failed_command_count']},{metrics['total_adjustment_magnitude_mm']:.1f},"
                 f"{metrics['risky_posture_total_time_sec']:.1f}\n")
