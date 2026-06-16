@@ -72,7 +72,6 @@ def indy7_socket_listener():
     finally: server_socket.close()
 
 def speak_voice(text):
-    """비동기 TTS 음성 출력"""
     def _speak():
         engine = pyttsx3.init()
         engine.setProperty('rate', 160)
@@ -81,7 +80,6 @@ def speak_voice(text):
     threading.Thread(target=_speak, daemon=True).start()
 
 def listen_for_command():
-    """작업자 음성 명령 원문 인식 텍스트 반환"""
     r = sr.Recognizer()
     r.energy_threshold = 300 
     r.dynamic_energy_threshold = True 
@@ -100,7 +98,6 @@ def listen_for_command():
             return ""
 
 def check_positive_keywords(text):
-    """Rule-based 구체화된 긍정 판단 리스트"""
     clean_text = text.replace(" ", "").strip()
     positive_keywords = ["응", "어", "네", "예", "조정", "그래", "해줘", "맞아", "오케이", "ok", "좋아", "이동"]
     return any(keyword in clean_text for keyword in positive_keywords)
@@ -134,7 +131,6 @@ def main():
     socket_thread = threading.Thread(target=indy7_socket_listener, daemon=True)
     socket_thread.start()
     
-    # 엑셀 매트릭스 평가지표 
     metrics = {
         "completed_transfers": 0,
         "robot_adjustment_count": 0,
@@ -143,18 +139,16 @@ def main():
         "invalid_failed_command_count": 0,
         "total_adjustment_magnitude_mm": 0.0,
         "risky_posture_total_time_sec": 0.0,
-        "total_rula_score": 0.0 # RULA 누적 점수 추가
+        "total_rula_score": 0.0 
     }
-    cycle_durations = [] # 사이클당 소요시간 저장 배열
+    cycle_durations = [] 
 
-    # 15초 타임라인 상태 머신
     STATE_IDLE = "IDLE"
     STATE_TRACKING = "TRACKING"
     current_state = STATE_IDLE
     cycle_start_time = 0.0
     cycle_angles = []
 
-    # 10분 실험 제한 타이머 (600초)
     CONDITION_DURATION = 600.0  
     condition_start_time = time.time()
 
@@ -169,7 +163,6 @@ def main():
             ret, frame = cap.read()
             if not ret: break
             
-            # 10분 만료 체크
             elapsed_total = time.time() - condition_start_time
             time_left = max(0.0, CONDITION_DURATION - elapsed_total)
             if time_left <= 0:
@@ -189,16 +182,15 @@ def main():
                 mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
                 lm = results.pose_landmarks.landmark
                 
-                if lm[12].visibility > 0.5 and lm[14].visibility > 0.5 and lm[16].visibility > 0.5:
-                    sh_deg, avg_sh_deg, tmp_elb_deg, tmp_adj_mm, tmp_target_z = ik_engine.calculate_ik(lm[12], lm[14], lm[16], control_type)
-                    current_frame_sh_deg = avg_sh_deg
-                    elb_deg = tmp_elb_deg
-                    adj_mm = tmp_adj_mm
-                    target_pass_floor_z_mm = tmp_target_z
+                # 💡 [핵심 수정] 가시성(visibility) 문턱값을 완전히 삭제했습니다!
+                # MediaPipe가 뼈대(오른팔)를 그리기만 하면 무조건 각도를 억지로라도 계산합니다.
+                # 단, 오른팔(12번 어깨, 14번 팔꿈치)을 기준으로 하므로 카메라에 오른팔이 보여야 합니다.
+                sh_deg, avg_sh_deg, tmp_elb_deg, tmp_adj_mm, tmp_target_z = ik_engine.calculate_ik(lm[12], lm[14], lm[16], control_type)
+                current_frame_sh_deg = avg_sh_deg
+                elb_deg = tmp_elb_deg
+                adj_mm = tmp_adj_mm
+                target_pass_floor_z_mm = tmp_target_z
                     
-            # ---------------------------------------------------------
-            # 🔄 1사이클 (15초 구간) 비동기 타임라인 흐름
-            # ---------------------------------------------------------
             if current_state == STATE_IDLE:
                 if gripper_open_event.is_set():
                     gripper_open_event.clear()
@@ -225,10 +217,7 @@ def main():
                     cv2.putText(frame, phase_msg, (30, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                     
                 else:
-                    # 15초 태스크 종료 -> 평균 계산 및 룰라 판단
                     final_avg_sh_angle = sum(cycle_angles) / len(cycle_angles) if cycle_angles else 0.0
-                    
-                    # [추가] 이번 사이클의 RULA 어깨 상지 위험 점수 추출
                     cycle_rula_score = ik_engine.calculate_rula_score(final_avg_sh_angle)
                     metrics["total_rula_score"] += cycle_rula_score
                     
@@ -236,6 +225,8 @@ def main():
                     
                     is_risky = (final_avg_sh_angle >= 60.0)
                     is_finally_approved = False
+                    
+                    final_json_str = '{"description": "안전 각도(60도 미만) 유지로 인한 로봇 이동 없음"}'
                     
                     if is_risky:
                         metrics["risky_posture_total_time_sec"] += 15.0 
@@ -252,7 +243,6 @@ def main():
                             if control_type != "llm":
                                 is_approved_rule = check_positive_keywords(user_voice_text)
 
-                        # LLM 의도 해석 및 제어 타겟 캡슐화 모듈 호출
                         final_json_str, llm_metrics, final_z_m = controller.run_task(
                             condition=CURRENT_CONDITION, sh_angle=current_frame_sh_deg, avg_sh_angle=final_avg_sh_angle,
                             elb_angle=elb_deg, target_pass_floor_z_mm=target_pass_floor_z_mm, adj_mm=adj_mm, 
@@ -279,12 +269,10 @@ def main():
                     else:
                         print(f"[안전 확인] 15초 유지 구간 평균 각도({final_avg_sh_angle:.1f}도)가 허용 한계(60도) 미만입니다.")
                     
-                    # 1사이클 전체 태스크 소요 시간 산출 및 지표 기록 완료
                     metrics["completed_transfers"] += 1
                     task_completion_time = time.time() - cycle_start_time
                     cycle_durations.append(task_completion_time)
                     
-                    # [추가] 상세 로그 JSON에 rula_score 필드 저장
                     log_data = {
                         "time": time.strftime('%Y-%m-%d %H:%M:%S'),
                         "condition": CURRENT_CONDITION["name"],
@@ -293,16 +281,20 @@ def main():
                         "avg_shoulder_angle": round(final_avg_sh_angle, 1),
                         "rula_score": cycle_rula_score,
                         "is_risky": is_risky,
-                        "is_approved": is_finally_approved
+                        "is_approved": is_finally_approved,
+                        "robot_payload": json.loads(final_json_str) 
                     }
                     with open(SAVE_FILENAME, "a", encoding="utf-8") as f:
                         f.write(json.dumps(log_data, ensure_ascii=False) + "\n")
                     
+                    # 💡 여기가 핵심! 사이클이 끝나면 다음 '엔터(그리퍼 신호)'를 기다립니다.
                     current_state = STATE_IDLE
 
             min_left, sec_left = int(time_left // 60), int(time_left % 60)
             cv2.putText(frame, f"Cond: {CURRENT_CONDITION['name']} | Time Left: {min_left:02d}:{sec_left:02d}", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(frame, f"Transfers: {metrics['completed_transfers']} | Cur Frame Angle: {current_frame_sh_deg:.1f}", (30, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # 여기서 실시간으로 변하는 각도 수치를 직접 확인할 수 있습니다!
+            cv2.putText(frame, f"Transfers: {metrics['completed_transfers']} | Cur Angle: {current_frame_sh_deg:.1f}", (30, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
             cv2.imshow('HRI Experiment System', frame)
             if cv2.waitKey(1) & 0xFF == 27: break
@@ -310,7 +302,6 @@ def main():
     cap.release()
     cv2.destroyAllWindows()
 
-    # 10분 통계 매트릭스 CSV 누적 작성 (RULA 평균 점수 추가)
     avg_cycle_time = sum(cycle_durations) / len(cycle_durations) if cycle_durations else 0.0
     avg_rula = metrics["total_rula_score"] / metrics["completed_transfers"] if metrics["completed_transfers"] > 0 else 0.0
     
