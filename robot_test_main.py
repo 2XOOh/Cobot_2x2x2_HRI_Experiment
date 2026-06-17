@@ -7,12 +7,10 @@ import threading
 import pyttsx3
 import speech_recognition as sr
 
-try:
-    from mediapipe.python.solutions import pose as mp_pose
-    from mediapipe.python.solutions import drawing_utils as mp_drawing
-except (ImportError, AttributeError):
-    import mediapipe.solutions.pose as mp_pose
-    import mediapipe.solutions.drawing_utils as mp_drawing
+# robot_test_main.py 상단 임포트 부분 (이 3줄로 완전히 교체하세요)
+import mediapipe as mp
+mp_pose = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils
 
 from ik_rula_manager import RobotIKManager
 from experiment_controller import PickAndPlaceExperiment
@@ -75,17 +73,18 @@ def speak_voice(text):
     threading.Thread(target=_speak, daemon=True).start()
 
 def listen_for_command():
-    r = sr.Recognizer()
-    with sr.Microphone() as source:
-        print("\n🎤 [마이크 대기] 의도를 말씀해 주세요 (예: '응 해줘', '아니 싫어')...")
-        try:
-            audio = r.listen(source, timeout=4.0, phrase_time_limit=5.0) 
+    try:
+        import speech_recognition as sr
+        r = sr.Recognizer()
+        with sr.Microphone() as source:
+            print("\n🎤 [마이크 대기] 의도를 말씀해 주세요...")
+            audio = r.listen(source, timeout=4.0, phrase_time_limit=5.0)
             text = r.recognize_google(audio, language='ko-KR')
-            print(f"🗣️ [음성 인식 완료]: '{text}'")
             return text
-        except:
-            print("⚠️ [인식 실패] 음성이 감지되지 않았습니다.")
-            return ""
+    except Exception as e:
+        print(f"\n⚠️ [마이크 사용 불가]: {e}")
+        # 마이크가 안 되면 키보드로 직접 입력받도록 변경
+        return input("👉 마이크가 없으므로 텍스트로 직접 입력하세요 (예: 응 올려줘): ")
 
 def check_positive_keywords(text):
     clean_text = text.replace(" ", "").strip()
