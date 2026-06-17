@@ -1,0 +1,6 @@
+{"time": "2026-06-17 17:23:14", "condition": "Cond1_Sys_LLM", "angle": 10.7, "robot_payload": {"description": "안전 각도(60도 미만) 유지로 인한 로봇 이동 없음"}}
+{"time": "2026-06-17 17:23:23", "condition": "Cond1_Sys_LLM", "angle": 38.7, "robot_payload": {"description": "안전 각도(60도 미만) 유지로 인한 로봇 이동 없음"}}
+{"time": "2026-06-17 17:23:34", "condition": "Cond1_Sys_LLM", "angle": 36.2, "robot_payload": {"description": "안전 각도(60도 미만) 유지로 인한 로봇 이동 없음"}}
+{"time": "2026-06-17 17:28:38", "condition": "Cond3_Worker_LLM", "angle": 23.1, "robot_payload": {"description": "안전 각도(60도 미만) 유지로 인한 로봇 이동 없음"}}
+{"time": "2026-06-17 17:29:05", "condition": "Cond3_Worker_LLM", "angle": 109.3, "robot_payload": {"frame_id": "link0", "timestamp": "2026-06-17T17:29:04.978+09:00", "armpit_angle_deg": 109.3, "elbow_angle_deg": 98.8, "position": {"x": 0.45, "y": 0.0, "z": 0.721}, "orientation": {"x": 0.0, "y": 0.9239, "z": 0.0, "w": 0.3827}, "description": "[LLM Error] 음성 분석 실패로 현재 위치를 유지합니다."}}
+{"time": "2026-06-17 17:29:41", "condition": "Cond3_Worker_LLM", "angle": 80.5, "robot_payload": {"frame_id": "link0", "timestamp": "2026-06-17T17:29:41.382+09:00", "armpit_angle_deg": 80.5, "elbow_angle_deg": 121.7, "position": {"x": 0.45, "y": 0.0, "z": 0.721}, "orientation": {"x": 0.0, "y": 0.9239, "z": 0.0, "w": 0.3827}, "description": "[LLM Error] 음성 분석 실패로 현재 위치를 유지합니다."}}
