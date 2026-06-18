@@ -23,13 +23,14 @@ from real_robot_gripper_source import start_real_robot_gripper_listener
 # =========================================================
 # API 및 환경 설정
 # =========================================================
-OPENAI_API_KEY = "api-key"
+OPENAI_API_KEY = "apikey"
 LLAMA_BASE_URL = "https://api.groq.com/openai/v1" 
 
 DEFAULT_PASS_FLOOR_Z_CM = 135.5
 RESULT_DIR = os.path.join(os.path.dirname(__file__), "results")
 SAVE_FILENAME = os.path.join(RESULT_DIR, "experiment_log_detailed.json")
 SUMMARY_FILENAME = os.path.join(RESULT_DIR, "experiment_summary_metrics.csv")
+RAW_CSV_FILENAME = os.path.join(RESULT_DIR, "experiment_raw_data_per_trial.csv") # 💡 로우 데이터용 CSV 추가
 
 # 5가지 실험 조건 매트릭스
 CONDITIONS = {
@@ -41,6 +42,9 @@ CONDITIONS = {
 }
 
 gripper_open_event = threading.Event()
+
+# 💡 목표 실험 횟수 (15회)
+MAX_TRIALS = 15 
 
 # =========================================================
 # 통신 및 음성 인터페이스
@@ -103,7 +107,7 @@ def check_positive_keywords(text):
     return any(keyword in clean_text for keyword in positive_keywords)
 
 # =========================================================
-# 메인 실험 루프 및 15초/10분 상태 머신
+# 메인 실험 루프 및 상태 머신 (15회 기준)
 # =========================================================
 def main():
     if not os.path.exists(RESULT_DIR): os.makedirs(RESULT_DIR)
@@ -149,9 +153,6 @@ def main():
     cycle_start_time = 0.0
     cycle_angles = []
 
-    CONDITION_DURATION = 600.0  
-    condition_start_time = time.time()
-
     cap = cv2.VideoCapture(0)
     speak_voice(f"실험 세션을 시작합니다. 현재 조건은 {CURRENT_CONDITION['name']} 입니다.")
    
@@ -160,14 +161,14 @@ def main():
         control_type = CURRENT_CONDITION["control"]
        
         while cap.isOpened():
+            # 💡 [핵심 수정] 목표 횟수 15회 도달 시 자동 종료
+            if metrics["completed_transfers"] >= MAX_TRIALS:
+                print(f"\n⏹ [실험 종료] 설정된 목표 횟수({MAX_TRIALS}회)를 모두 달성했습니다.")
+                speak_voice("모든 실험 횟수가 완료되었습니다. 수고하셨습니다.")
+                break
+
             ret, frame = cap.read()
             if not ret: break
-            
-            elapsed_total = time.time() - condition_start_time
-            time_left = max(0.0, CONDITION_DURATION - elapsed_total)
-            if time_left <= 0:
-                print(f"\n⏱ [시간 종료] 10분이 경과하여 해당 실험 조건이 종료되었습니다.")
-                break
 
             frame = cv2.flip(frame, 1)
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -182,9 +183,6 @@ def main():
                 mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
                 lm = results.pose_landmarks.landmark
                 
-                # 💡 [핵심 수정] 가시성(visibility) 문턱값을 완전히 삭제했습니다!
-                # MediaPipe가 뼈대(오른팔)를 그리기만 하면 무조건 각도를 억지로라도 계산합니다.
-                # 단, 오른팔(12번 어깨, 14번 팔꿈치)을 기준으로 하므로 카메라에 오른팔이 보여야 합니다.
                 sh_deg, avg_sh_deg, tmp_elb_deg, tmp_adj_mm, tmp_target_z = ik_engine.calculate_ik(lm[12], lm[14], lm[16], control_type)
                 current_frame_sh_deg = avg_sh_deg
                 elb_deg = tmp_elb_deg
@@ -225,12 +223,14 @@ def main():
                     
                     is_risky = (final_avg_sh_angle >= 60.0)
                     is_finally_approved = False
+                    user_voice_text = ""
                     
+                    # 위험하지 않을 때의 기본값 세팅
+                    final_z_m = round((ik_engine.current_pass_floor_z_mm - ik_engine.LINK0_HEIGHT_MM) / 1000, 3) 
                     final_json_str = '{"description": "안전 각도(60도 미만) 유지로 인한 로봇 이동 없음"}'
                     
                     if is_risky:
                         metrics["risky_posture_total_time_sec"] += 15.0 
-                        user_voice_text = ""
                         is_approved_rule = False
                         
                         if lead_type == "시스템":
@@ -243,6 +243,7 @@ def main():
                             if control_type != "llm":
                                 is_approved_rule = check_positive_keywords(user_voice_text)
 
+                        # experiment_controller (두뇌) 호출
                         final_json_str, llm_metrics, final_z_m = controller.run_task(
                             condition=CURRENT_CONDITION, sh_angle=current_frame_sh_deg, avg_sh_angle=final_avg_sh_angle,
                             elb_angle=elb_deg, target_pass_floor_z_mm=target_pass_floor_z_mm, adj_mm=adj_mm, 
@@ -273,6 +274,7 @@ def main():
                     task_completion_time = time.time() - cycle_start_time
                     cycle_durations.append(task_completion_time)
                     
+                    # 💡 1. 상세 로그 JSON 저장 (기존 유지)
                     log_data = {
                         "time": time.strftime('%Y-%m-%d %H:%M:%S'),
                         "condition": CURRENT_CONDITION["name"],
@@ -286,15 +288,25 @@ def main():
                     }
                     with open(SAVE_FILENAME, "a", encoding="utf-8") as f:
                         f.write(json.dumps(log_data, ensure_ascii=False) + "\n")
+                        
+                    # 💡 2. 로우 데이터(Raw Data) CSV 저장 (교수님 분석용 추가)
+                    raw_file_exists = os.path.isfile(RAW_CSV_FILENAME)
+                    with open(RAW_CSV_FILENAME, "a", encoding="utf-8") as f:
+                        if not raw_file_exists:
+                            # 엑셀 헤더 작성
+                            f.write("Time,Condition,Trial_Num,Intervention,Lead_Type,Control_Type,Avg_Shoulder_Angle,RULA_Score,Is_Risky,User_Voice,Final_Z_m,Is_Approved\n")
+                        
+                        voice_log = user_voice_text if user_voice_text else "None"
+                        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{CURRENT_CONDITION['name']},{metrics['completed_transfers']},"
+                                f"{CURRENT_CONDITION['intervention']},{lead_type},{control_type},{final_avg_sh_angle:.1f},"
+                                f"{cycle_rula_score},{is_risky},{voice_log},{final_z_m:.3f},{is_finally_approved}\n")
                     
-                    # 💡 여기가 핵심! 사이클이 끝나면 다음 '엔터(그리퍼 신호)'를 기다립니다.
+                    # 사이클 종료 후 대기 상태로 복귀
                     current_state = STATE_IDLE
 
-            min_left, sec_left = int(time_left // 60), int(time_left % 60)
-            cv2.putText(frame, f"Cond: {CURRENT_CONDITION['name']} | Time Left: {min_left:02d}:{sec_left:02d}", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            
-            # 여기서 실시간으로 변하는 각도 수치를 직접 확인할 수 있습니다!
-            cv2.putText(frame, f"Transfers: {metrics['completed_transfers']} | Cur Angle: {current_frame_sh_deg:.1f}", (30, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            # 화면 텍스트 타이머 제거 및 사이클 카운트 표시로 변경
+            cv2.putText(frame, f"Cond: {CURRENT_CONDITION['name']} | Trial: {metrics['completed_transfers']} / {MAX_TRIALS}", (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(frame, f"Cur Angle: {current_frame_sh_deg:.1f} deg", (30, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
             cv2.imshow('HRI Experiment System', frame)
             if cv2.waitKey(1) & 0xFF == 27: break
@@ -306,18 +318,18 @@ def main():
     avg_rula = metrics["total_rula_score"] / metrics["completed_transfers"] if metrics["completed_transfers"] > 0 else 0.0
     
     print("\n" + "="*50)
-    print(f"📊 [{CURRENT_CONDITION['name']}] 10분 실험 세션 종료")
-    print(f" - 총 완료 블록 전달 횟수 (Transfers): {metrics['completed_transfers']} 회")
+    print(f"📊 [{CURRENT_CONDITION['name']}] 총 {metrics['completed_transfers']}회 실험 세션 종료")
     print(f" - 평균 1사이클 소요 시간 (Task Completion Time): {avg_cycle_time:.2f} 초")
-    print(f" - 10분 구간 평균 RULA 점수: {avg_rula:.2f} 점")
+    print(f" - 전체 평균 RULA 점수: {avg_rula:.2f} 점")
     print("="*50)
     
+    # 💡 3. 종합 결과 요약 CSV 저장 (기존 유지)
     file_exists = os.path.isfile(SUMMARY_FILENAME)
     with open(SUMMARY_FILENAME, "a", encoding="utf-8") as f:
         if not file_exists:
-            f.write("Time,Condition,Duration(s),Transfers,Avg_Task_Completion_Time(s),Avg_RULA_Score,Adjustments,Interventions,Correction_Cmds,Invalid_Cmds,Total_Adj_mm,Risky_Time(s)\n")
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{CURRENT_CONDITION['name']},{CONDITION_DURATION},"
-                f"{metrics['completed_transfers']},{avg_cycle_time:.2f},{avg_rula:.2f},{metrics['robot_adjustment_count']},"
+            f.write("Time,Condition,Total_Trials,Avg_Task_Completion_Time(s),Avg_RULA_Score,Adjustments,Interventions,Correction_Cmds,Invalid_Cmds,Total_Adj_mm,Risky_Time(s)\n")
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{CURRENT_CONDITION['name']},{metrics['completed_transfers']},"
+                f"{avg_cycle_time:.2f},{avg_rula:.2f},{metrics['robot_adjustment_count']},"
                 f"{metrics['system_intervention_count']},{metrics['correction_commands_count']},"
                 f"{metrics['invalid_failed_command_count']},{metrics['total_adjustment_magnitude_mm']:.1f},"
                 f"{metrics['risky_posture_total_time_sec']:.1f}\n")
