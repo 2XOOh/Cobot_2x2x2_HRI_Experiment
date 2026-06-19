@@ -27,11 +27,6 @@ from real_robot_gripper_source import start_real_robot_gripper_listener
 OPENAI_API_KEY = "apikey"
 LLAMA_BASE_URL = "https://api.groq.com/openai/v1" 
 
-USER_HEIGHT_CM = 175.0          
-USER_SHOULDER_HEIGHT_CM = 145.0 
-L1_CM = 30.0                    
-L2_CM = 25.0                    
-
 TOTAL_TRIALS_PER_CONDITION = 10 # 10회 통제
 
 DEFAULT_PASS_FLOOR_Z_CM = 135.5
@@ -39,7 +34,7 @@ RESULT_DIR = os.path.join(os.path.dirname(__file__), "results")
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 SAVE_FILENAME = os.path.join(RESULT_DIR, "experiment_log_detailed.json")
-SUMMARY_FILENAME = os.path.join(RESULT_DIR, "experiment_summary_matrix.csv") # 이름 변경
+SUMMARY_FILENAME = os.path.join(RESULT_DIR, "experiment_summary_matrix.csv")
 RAW_CSV_FILENAME = os.path.join(RESULT_DIR, "experiment_raw_data_per_trial.csv")
 
 # 5가지 실험 조건
@@ -101,8 +96,42 @@ def estimate_rula_score(shoulder_angle, elbow_angle):
 
 def main():
     global voice_command, running
-    
+
+    # =========================================================
+    # 💡 1. 피실험자 신체 정보 직접 입력
+    # =========================================================
+    print("\n" + "="*60)
+    print(" 🧑‍🔧 피실험자 신체 정보 입력 (엔터키를 누르면 괄호 안의 기본값 적용)")
     print("="*60)
+    
+    try:
+        in_h = input(" 1. 작업자 키 (cm) [기본: 175.0]: ")
+        USER_HEIGHT_CM = float(in_h) if in_h.strip() else 175.0
+    except: USER_HEIGHT_CM = 175.0
+    
+    try:
+        # 어깨 높이 미입력시 키에서 30cm 뺀 값을 추천값으로 띄움
+        default_sh = USER_HEIGHT_CM - 30.0
+        in_sh = input(f" 2. 어깨까지의 높이 (cm) [기본: {default_sh}]: ")
+        USER_SHOULDER_HEIGHT_CM = float(in_sh) if in_sh.strip() else default_sh
+    except: USER_SHOULDER_HEIGHT_CM = USER_HEIGHT_CM - 30.0
+
+    try:
+        in_l1 = input(" 3. 상완 길이 (어깨~팔꿈치, cm) [기본: 30.0]: ")
+        L1_CM = float(in_l1) if in_l1.strip() else 30.0
+    except: L1_CM = 30.0
+    
+    try:
+        in_l2 = input(" 4. 하완 길이 (팔꿈치~손목, cm) [기본: 25.0]: ")
+        L2_CM = float(in_l2) if in_l2.strip() else 25.0
+    except: L2_CM = 25.0
+
+    print(f"\n [적용 완료] 키: {USER_HEIGHT_CM}cm | 어깨 높이: {USER_SHOULDER_HEIGHT_CM}cm | 상완: {L1_CM}cm | 하완: {L2_CM}cm")
+
+    # =========================================================
+    # 2. 실험 조건 입력
+    # =========================================================
+    print("\n" + "="*60)
     for k, v in CONDITIONS.items(): print(f" [{k}] {v['name']}")
     print("="*60)
     try: choice = int(input("수행할 실험 조건 번호를 입력하세요 (1~5): "))
@@ -113,13 +142,13 @@ def main():
     stt_thread.start()
     start_real_robot_gripper_listener(gripper_open_event)
 
+    # 💡 3. 입력받은 신체 정보를 물리 계산기(IK Manager)에 전달
     ik_manager = RobotIKManager(h_shoulder_cm=USER_SHOULDER_HEIGHT_CM, l1_cm=L1_CM, l2_cm=L2_CM, current_pass_floor_z_cm=DEFAULT_PASS_FLOOR_Z_CM)
     experiment_controller = PickAndPlaceExperiment(api_key=OPENAI_API_KEY, base_url=LLAMA_BASE_URL)
 
     cap = cv2.VideoCapture(0)
     mp_pose_instance = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
-    # 💡 엑셀 추출용 메트릭스 통합 관리
     metrics = {
         "completed_transfers": 0,
         "total_rula_score": 0,
@@ -128,17 +157,18 @@ def main():
         "robot_adjustment_count": 0,
         "total_adjustment_magnitude_mm": 0.0,
         "correction_commands_count": 0,
-        "invalid_cmds": 0 # LLM 오류/실패 횟수 추가
+        "invalid_cmds": 0 
     }
     
     cycle_durations = []
-    llm_latencies = [] # LLM 연산 소요 시간 추가
+    llm_latencies = [] 
     
     current_state = "INIT_START"
     trial_count = 0
     cycle_start_time = time.time()
     wait_start_time = 0.0
     
+    # 💡 4. 로봇 원점 높이 계산 (입력받은 키의 1.1배)
     ORIGIN_Z_MM = USER_HEIGHT_CM * 1.1 * 10.0 
     current_tighten_z_mm = DEFAULT_PASS_FLOOR_Z_CM * 10.0
 
@@ -218,7 +248,7 @@ def main():
         elif current_state == "EVALUATE_POSTURE":
             lead_type = CURRENT_CONDITION["lead"]
             control_type = CURRENT_CONDITION["control"]
-            is_risky = (cycle_avg_sh >= 90.0) # 위험 각도 90도 유지
+            is_risky = (cycle_avg_sh >= 90.0)
             
             user_response_text = ""
             is_approved_rule = False
@@ -272,7 +302,6 @@ def main():
             if not user_response_text:
                 user_response_text = f"평균 어깨 각도 {cycle_avg_sh:.1f}도로 체결함"
 
-            # 💡 LLM 지연 시간(Latency) 측정 로직 추가
             llm_start_time = time.time()
             llm_result = experiment_controller.run_task(
                 condition=CURRENT_CONDITION, sh_angle=shoulder_ang, avg_sh_angle=cycle_avg_sh,
@@ -286,7 +315,6 @@ def main():
             next_target_z_m = llm_result.get("final_z_m", current_tighten_z_mm / 1000.0)
             next_target_z_mm = next_target_z_m * 1000.0
             
-            # 메트릭스 데이터 누적
             adj_mag = abs(next_target_z_mm - current_tighten_z_mm)
             metrics["total_adjustment_magnitude_mm"] += adj_mag
             if adj_mag > 10.0: metrics["robot_adjustment_count"] += 1
@@ -298,7 +326,6 @@ def main():
             
             SendPassGoal({"target_z_mm": current_tighten_z_mm, "msg": f"Trial {trial_count} Setup"})
             
-            # 로우데이터 CSV 저장 (Latency, Invalid 여부 추가)
             raw_file_exists = os.path.isfile(RAW_CSV_FILENAME)
             with open(RAW_CSV_FILENAME, "a", encoding="utf-8") as f:
                 if not raw_file_exists: f.write("Time,Condition,Trial_Num,Lead_Type,Control_Type,Avg_Shoulder,Avg_Elbow,RULA,User_Voice,Final_Z_m,Is_Approved,LLM_Latency_s,Is_Invalid\n")
@@ -337,7 +364,6 @@ def main():
     print(f"📊 [{CURRENT_CONDITION['name']}] 매트릭스 추출 완료")
     print("="*60)
     
-    # 💡 종합 요약 CSV (교수님 매트릭스 100% 동일 양식 적용)
     file_exists = os.path.isfile(SUMMARY_FILENAME)
     with open(SUMMARY_FILENAME, "a", encoding="utf-8") as f:
         if not file_exists:
