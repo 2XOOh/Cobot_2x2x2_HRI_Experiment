@@ -215,7 +215,7 @@ def main():
             time.sleep(3.0)
             
             with voice_lock: voice_command = None 
-            speak("블록의 다섯 개 구멍에 볼트를 체결해 주세요.")
+            speak("블록의 네 개 구멍에 볼트를 체결해 주세요.")
             current_state = "BOLT_TIGHTENING"
             cycle_start_time = time.time()
             accumulated_shoulder_angles.clear(); accumulated_elbow_angles.clear(); accumulated_rula_scores.clear()

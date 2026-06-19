@@ -29,10 +29,10 @@ class RobotIKManager:
         self.Delta_Z_buffer = 5.0
         self.FIXED_ADJUST_MM = -50.0
 
-        # 인체공학적 이상적인 목표 깊이 (어깨 20도, 팔꿈치 45도 중립 자세 기준)
+        # 인체공학적 이상적인 목표 깊이 (어깨 20도, 팔꿈치 0도 안정적인 어깨각도로 팔을 쭉 뻗었을때 자세 기준)
         self.Z_ideal = self.H_shoulder_mm - (
             self.L1 * math.cos(math.radians(20))
-            + self.L2 * math.cos(math.radians(45))
+            + self.L2 * math.cos(math.radians(0))
         )
 
     def calculate_angles_and_target(self, sh_deg, elb_deg, control_type="llm"):
