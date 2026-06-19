@@ -3,10 +3,10 @@ import cv2
 import time
 import json
 import os 
-import pyttsx3                  # TTS (음성 출력)
-import speech_recognition as sr # STT (음성 인식)
-import socket                   # 로봇과의 TCP/IP 통신용
-import threading                # 비전 카메라와 음성 인식을 동시에 처리하기 위한 스레드
+import pyttsx3                  # TTS
+import speech_recognition as sr # STT
+import socket                   
+import threading                
 import math
 
 try:
@@ -27,23 +27,22 @@ from real_robot_gripper_source import start_real_robot_gripper_listener
 OPENAI_API_KEY = "apikey"
 LLAMA_BASE_URL = "https://api.groq.com/openai/v1" 
 
-# 작업자 정보 및 실험 필수 상수 설정
 USER_HEIGHT_CM = 175.0          
 USER_SHOULDER_HEIGHT_CM = 145.0 
 L1_CM = 30.0                    
 L2_CM = 25.0                    
 
-TOTAL_TRIALS_PER_CONDITION = 10 # 한 컨디션당 10회
+TOTAL_TRIALS_PER_CONDITION = 10 # 10회 통제
 
 DEFAULT_PASS_FLOOR_Z_CM = 135.5
 RESULT_DIR = os.path.join(os.path.dirname(__file__), "results")
 os.makedirs(RESULT_DIR, exist_ok=True)
 
 SAVE_FILENAME = os.path.join(RESULT_DIR, "experiment_log_detailed.json")
-SUMMARY_FILENAME = os.path.join(RESULT_DIR, "experiment_summary.csv")
+SUMMARY_FILENAME = os.path.join(RESULT_DIR, "experiment_summary_matrix.csv") # 이름 변경
 RAW_CSV_FILENAME = os.path.join(RESULT_DIR, "experiment_raw_data_per_trial.csv")
 
-# 5가지 실험 조건 매트릭스
+# 5가지 실험 조건
 CONDITIONS = {
     1: {"intervention": "개입", "lead": "시스템", "control": "llm", "name": "Cond1_Sys_LLM"},
     2: {"intervention": "개입", "lead": "시스템", "control": "rule", "name": "Cond2_Sys_Rule"},
@@ -52,7 +51,6 @@ CONDITIONS = {
     5: {"intervention": "비개입", "lead": "시스템", "control": "none", "name": "Cond5_Control_NoInterv"}
 }
 
-# 공유 변수 및 이벤트
 gripper_open_event = threading.Event()
 voice_command = None
 voice_lock = threading.Lock()
@@ -66,7 +64,6 @@ def speak(text):
         engine.runAndWait()
     threading.Thread(target=_speak, daemon=True).start()
 
-# STT 스레드
 def speech_recognition_thread():
     global voice_command
     recognizer = sr.Recognizer()
@@ -82,10 +79,8 @@ def speech_recognition_thread():
                 print(f"🗣️ [음성 인식]: '{text}'")
                 with voice_lock:
                     voice_command = text
-            except sr.WaitTimeoutError:
-                continue
-            except Exception:
-                continue
+            except sr.WaitTimeoutError: continue
+            except Exception: continue
 
 def calculate_angle(a, b, c):
     ba = [a[0] - b[0], a[1] - b[1]]
@@ -110,11 +105,9 @@ def main():
     print("="*60)
     for k, v in CONDITIONS.items(): print(f" [{k}] {v['name']}")
     print("="*60)
-    try:
-        choice = int(input("수행할 실험 조건 번호를 입력하세요 (1~5): "))
-        CURRENT_CONDITION = CONDITIONS[choice]
-    except:
-        CURRENT_CONDITION = CONDITIONS[1]
+    try: choice = int(input("수행할 실험 조건 번호를 입력하세요 (1~5): "))
+    except: choice = 1
+    CURRENT_CONDITION = CONDITIONS.get(choice, CONDITIONS[1])
 
     stt_thread = threading.Thread(target=speech_recognition_thread, daemon=True)
     stt_thread.start()
@@ -126,25 +119,26 @@ def main():
     cap = cv2.VideoCapture(0)
     mp_pose_instance = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
+    # 💡 엑셀 추출용 메트릭스 통합 관리
     metrics = {
         "completed_transfers": 0,
-        "risky_posture_time_sec": 0,
         "total_rula_score": 0,
-        "robot_adjustment_count": 0,
+        "risky_posture_time_sec": 0,
         "system_intervention_count": 0,
+        "robot_adjustment_count": 0,
+        "total_adjustment_magnitude_mm": 0.0,
         "correction_commands_count": 0,
-        "total_adjustment_magnitude_mm": 0.0
+        "invalid_cmds": 0 # LLM 오류/실패 횟수 추가
     }
     
     cycle_durations = []
+    llm_latencies = [] # LLM 연산 소요 시간 추가
     
-    # 상태 제어 관련 변수들
     current_state = "INIT_START"
     trial_count = 0
     cycle_start_time = time.time()
     wait_start_time = 0.0
     
-    # 위치 변수: 로봇 원점 높이 & 현재 작업 높이 분리
     ORIGIN_Z_MM = USER_HEIGHT_CM * 1.1 * 10.0 
     current_tighten_z_mm = DEFAULT_PASS_FLOOR_Z_CM * 10.0
 
@@ -177,12 +171,9 @@ def main():
             current_rula = estimate_rula_score(shoulder_ang, elbow_ang)
             if current_rula >= 4: metrics["risky_posture_time_sec"] += 0.1
 
-        # =========================================================
-        # 🤖 1. 상태: 실험 시작 및 최초 위치 하강
-        # =========================================================
         if current_state == "INIT_START":
             speak(f"[{CURRENT_CONDITION['name']}] 첫 번째 조립 위치로 이동합니다.")
-            SendPassGoal({"target_z_mm": current_tighten_z_mm, "msg": "Initial move to tighten pos"})
+            SendPassGoal({"target_z_mm": current_tighten_z_mm, "msg": "Initial move"})
             time.sleep(3.0)
             
             with voice_lock: voice_command = None 
@@ -191,9 +182,6 @@ def main():
             cycle_start_time = time.time()
             accumulated_shoulder_angles.clear(); accumulated_elbow_angles.clear(); accumulated_rula_scores.clear()
 
-        # =========================================================
-        # 🤖 2. 상태: 조립 작업 및 각도 모니터링
-        # =========================================================
         elif current_state == "BOLT_TIGHTENING":
             if shoulder_ang > 0:
                 accumulated_shoulder_angles.append(shoulder_ang)
@@ -210,9 +198,6 @@ def main():
                 print(f"[작업 완료 음성 감지]: '{local_voice}'")
                 current_state = "RELEASE_BLOCK"
 
-        # =========================================================
-        # 🤖 3. 상태: 블록 해제
-        # =========================================================
         elif current_state == "RELEASE_BLOCK":
             speak("조립 완료. 그리퍼를 해제합니다. 블록을 내려놓으세요.")
             SendPassGoal({"command": "GRIPPER_OPEN"})
@@ -224,27 +209,20 @@ def main():
             time.sleep(2.5)
             current_state = "MOVE_TO_ORIGIN" 
 
-        # =========================================================
-        # 🤖 4. 상태: 원점 복귀 (다음 블록 대기)
-        # =========================================================
         elif current_state == "MOVE_TO_ORIGIN":
             speak("로봇이 원점으로 복귀하여 대기합니다.")
-            SendPassGoal({"target_z_mm": ORIGIN_Z_MM, "msg": "Return to origin standby"})
+            SendPassGoal({"target_z_mm": ORIGIN_Z_MM, "msg": "Return to origin"})
             time.sleep(3.0) 
             current_state = "EVALUATE_POSTURE"
 
-        # =========================================================
-        # 🤖 5. 상태: 원점에서 자세 평가 및 조절 여부 질의
-        # =========================================================
         elif current_state == "EVALUATE_POSTURE":
             lead_type = CURRENT_CONDITION["lead"]
             control_type = CURRENT_CONDITION["control"]
-            is_risky = (cycle_avg_sh >= 90.0) 
+            is_risky = (cycle_avg_sh >= 90.0) # 위험 각도 90도 유지
             
             user_response_text = ""
             is_approved_rule = False
 
-            # [조건 분기] 비개입(none) 조건이면 자세와 상관없이 무시
             if control_type == "none":
                 speak("비개입 조건이므로 기존 높이를 그대로 유지합니다.")
                 is_approved_rule = False
@@ -266,9 +244,6 @@ def main():
                     is_approved_rule = False
                     current_state = "APPLY_NEXT_TARGET"
 
-        # =========================================================
-        # 🤖 6. 상태: 작업자 질의 응답 대기 (화면 유지)
-        # =========================================================
         elif current_state == "WAIT_ADJUST_ANSWER":
             elapsed_wait = time.time() - wait_start_time
             cv2.putText(frame, f"Waiting Answer... {5.0 - elapsed_wait:.1f}s", (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
@@ -280,16 +255,13 @@ def main():
             
             if user_response_text or elapsed_wait > 5.0:
                 if user_response_text: print(f"[작업자 답변]: '{user_response_text}'")
-                else: print("[대답 없음] 기본값(미승인)으로 진행합니다.")
+                else: print("[대답 없음] 기본값으로 진행합니다.")
                 
                 if CURRENT_CONDITION["control"] != "llm":
                     pos_kws = ["응", "어", "네", "예", "조정", "해줘", "맞아", "오케이", "ok", "좋아"]
                     is_approved_rule = any(kw in user_response_text.replace(" ", "") for kw in pos_kws)
                 current_state = "APPLY_NEXT_TARGET"
 
-        # =========================================================
-        # 🤖 7. 상태: 높이 계산 후 하강
-        # =========================================================
         elif current_state == "APPLY_NEXT_TARGET":
             trial_count += 1
             metrics["completed_transfers"] = trial_count
@@ -300,37 +272,42 @@ def main():
             if not user_response_text:
                 user_response_text = f"평균 어깨 각도 {cycle_avg_sh:.1f}도로 체결함"
 
+            # 💡 LLM 지연 시간(Latency) 측정 로직 추가
+            llm_start_time = time.time()
             llm_result = experiment_controller.run_task(
                 condition=CURRENT_CONDITION, sh_angle=shoulder_ang, avg_sh_angle=cycle_avg_sh,
                 elb_angle=cycle_avg_elb, target_pass_floor_z_mm=current_tighten_z_mm, adj_mm=0.0,
                 current_pass_floor_z_mm=current_tighten_z_mm, h_sh=USER_SHOULDER_HEIGHT_CM * 10, l1=L1_CM * 10, l2=L2_CM * 10,
                 user_voice_text=user_response_text, is_approved_rule=is_approved_rule
             )
+            latency = time.time() - llm_start_time
+            if CURRENT_CONDITION["control"] == "llm": llm_latencies.append(latency)
             
             next_target_z_m = llm_result.get("final_z_m", current_tighten_z_mm / 1000.0)
             next_target_z_mm = next_target_z_m * 1000.0
             
-            # 메트릭스 계산
+            # 메트릭스 데이터 누적
             adj_mag = abs(next_target_z_mm - current_tighten_z_mm)
             metrics["total_adjustment_magnitude_mm"] += adj_mag
             if adj_mag > 10.0: metrics["robot_adjustment_count"] += 1
             if llm_result.get("is_correction"): metrics["correction_commands_count"] += 1
+            if llm_result.get("is_invalid"): metrics["invalid_cmds"] += 1
                 
             current_tighten_z_mm = next_target_z_mm
             ik_manager.current_pass_floor_z_mm = next_target_z_mm
             
             SendPassGoal({"target_z_mm": current_tighten_z_mm, "msg": f"Trial {trial_count} Setup"})
             
-            # 로우데이터 CSV 저장
+            # 로우데이터 CSV 저장 (Latency, Invalid 여부 추가)
             raw_file_exists = os.path.isfile(RAW_CSV_FILENAME)
             with open(RAW_CSV_FILENAME, "a", encoding="utf-8") as f:
-                if not raw_file_exists: f.write("Time,Condition,Trial_Num,Lead_Type,Control_Type,Avg_Shoulder,Avg_Elbow,RULA,User_Voice,Final_Z_m,Is_Approved\n")
+                if not raw_file_exists: f.write("Time,Condition,Trial_Num,Lead_Type,Control_Type,Avg_Shoulder,Avg_Elbow,RULA,User_Voice,Final_Z_m,Is_Approved,LLM_Latency_s,Is_Invalid\n")
                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{CURRENT_CONDITION['name']},{trial_count},"
                         f"{CURRENT_CONDITION['lead']},{CURRENT_CONDITION['control']},{cycle_avg_sh:.1f},{cycle_avg_elb:.1f},"
-                        f"{cycle_avg_rula:.1f},{user_response_text},{next_target_z_m:.3f},{llm_result.get('is_approved', is_approved_rule)}\n")
+                        f"{cycle_avg_rula:.1f},{user_response_text},{next_target_z_m:.3f},{llm_result.get('is_approved', is_approved_rule)},{latency:.2f},{llm_result.get('is_invalid', False)}\n")
 
             if trial_count < TOTAL_TRIALS_PER_CONDITION:
-                speak(f"{trial_count + 1}번째 작업을 위해 로봇이 목표 위치로 하강합니다.")
+                speak(f"{trial_count + 1}번째 작업을 위해 로봇이 하강합니다.")
                 time.sleep(4.0) 
                 
                 with voice_lock: voice_command = None
@@ -353,23 +330,24 @@ def main():
 
     avg_cycle_time = sum(cycle_durations) / len(cycle_durations) if cycle_durations else 0.0
     avg_rula = metrics["total_rula_score"] / metrics["completed_transfers"] if metrics["completed_transfers"] > 0 else 0.0
+    avg_llm_latency = sum(llm_latencies) / len(llm_latencies) if llm_latencies else 0.0
+    avg_adj_mm = metrics["total_adjustment_magnitude_mm"] / metrics["completed_transfers"] if metrics["completed_transfers"] > 0 else 0.0
     
     print("\n" + "="*60)
-    print(f"📊 [{CURRENT_CONDITION['name']}] 총 {metrics['completed_transfers']}회 조립 실험 종료")
-    print(f" - 평균 소요 시간: {avg_cycle_time:.2f} 초 | 총평균 RULA: {avg_rula:.2f} 점")
+    print(f"📊 [{CURRENT_CONDITION['name']}] 매트릭스 추출 완료")
     print("="*60)
     
-    # 종합 요약 CSV 저장 (엑셀 매트릭스 양식 완벽 대응)
+    # 💡 종합 요약 CSV (교수님 매트릭스 100% 동일 양식 적용)
     file_exists = os.path.isfile(SUMMARY_FILENAME)
     with open(SUMMARY_FILENAME, "a", encoding="utf-8") as f:
         if not file_exists:
-            f.write("Time,Condition,Total_Trials,Avg_Task_Time(s),Avg_RULA,Adjust_Count,System_Interventions,Correction_Cmds,Total_Adj_mm,Risky_Duration(s)\n")
-        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{CURRENT_CONDITION['name']},{metrics['completed_transfers']},"
-                f"{avg_cycle_time:.2f},{avg_rula:.2f},{metrics['robot_adjustment_count']},"
-                f"{metrics['system_intervention_count']},{metrics['correction_commands_count']},"
-                f"{metrics['total_adjustment_magnitude_mm']:.1f},{metrics['risky_posture_time_sec']:.2f}\n")
+            f.write("Condition,Completed_Transfers,Avg_Task_Time_s,Avg_RULA,Risky_Time_s,System_Interventions,Adjust_Count,Avg_Adj_mm,Correction_Cmds,Invalid_Cmds,Avg_LLM_Latency_s\n")
+        f.write(f"{CURRENT_CONDITION['name']},{metrics['completed_transfers']},{avg_cycle_time:.2f},{avg_rula:.2f},"
+                f"{metrics['risky_posture_time_sec']:.2f},{metrics['system_intervention_count']},"
+                f"{metrics['robot_adjustment_count']},{avg_adj_mm:.1f},{metrics['correction_commands_count']},"
+                f"{metrics['invalid_cmds']},{avg_llm_latency:.2f}\n")
     
-    speak("수고하셨습니다. 실험 세션이 완료되었습니다.")
+    speak("수고하셨습니다. 실험이 종료되었습니다.")
 
 if __name__ == "__main__":
     main()
