@@ -3,8 +3,8 @@ import cv2
 import time
 import json
 import os 
-import pyttsx3                  # TTS
-import speech_recognition as sr # STT
+import pyttsx3                  
+import speech_recognition as sr 
 import socket                   
 import threading                
 import math
@@ -24,10 +24,10 @@ from real_robot_gripper_source import start_real_robot_gripper_listener
 # =========================================================
 # API 및 환경 설정
 # =========================================================
-OPENAI_API_KEY = "apikey" # ⚠️ 여기에 실제 Groq API 키를 다시 입력하세요!
+OPENAI_API_KEY = "apikey" # ⚠️ 여기에 실제 Groq API 키를 입력하세요.
 LLAMA_BASE_URL = "https://api.groq.com/openai/v1" 
 
-TOTAL_TRIALS_PER_CONDITION = 10 # 10회 통제
+TOTAL_TRIALS_PER_CONDITION = 10 
 
 DEFAULT_PASS_FLOOR_Z_CM = 135.5
 RESULT_DIR = os.path.join(os.path.dirname(__file__), "results")
@@ -37,19 +37,22 @@ SAVE_FILENAME = os.path.join(RESULT_DIR, "experiment_log_detailed.json")
 SUMMARY_FILENAME = os.path.join(RESULT_DIR, "experiment_summary_matrix.csv")
 RAW_CSV_FILENAME = os.path.join(RESULT_DIR, "experiment_raw_data_per_trial.csv")
 
-# 5가지 실험 조건
+# 💡 조건명 및 변수를 모두 영어로 수정했습니다.
 CONDITIONS = {
-    1: {"intervention": "개입", "lead": "시스템", "control": "llm", "name": "Cond1_Sys_LLM"},
-    2: {"intervention": "개입", "lead": "시스템", "control": "rule", "name": "Cond2_Sys_Rule"},
-    3: {"intervention": "개입", "lead": "작업자", "control": "llm", "name": "Cond3_Worker_LLM"},
-    4: {"intervention": "개입", "lead": "작업자", "control": "rule", "name": "Cond4_Worker_Rule"},
-    5: {"intervention": "비개입", "lead": "시스템", "control": "none", "name": "Cond5_Control_NoInterv"}
+    1: {"intervention": "Intervention", "lead": "System", "control": "LLM", "name": "Cond1_Sys_LLM"},
+    2: {"intervention": "Intervention", "lead": "System", "control": "Rule", "name": "Cond2_Sys_Rule"},
+    3: {"intervention": "Intervention", "lead": "Worker", "control": "LLM", "name": "Cond3_Worker_LLM"},
+    4: {"intervention": "Intervention", "lead": "Worker", "control": "Rule", "name": "Cond4_Worker_Rule"},
+    5: {"intervention": "Non-Intervention", "lead": "System", "control": "None", "name": "Cond5_Control_NoInterv"}
 }
 
 gripper_open_event = threading.Event()
 voice_command = None
 voice_lock = threading.Lock()
 running = True
+
+# 로봇에게 전달할 좌표와 시간을 담을 리스트 (JSON용)
+coordinate_logs = []
 
 def speak(text):
     print(f"[TTS] {text}")
@@ -100,9 +103,6 @@ def estimate_rula_score(shoulder_angle, elbow_angle):
 def main():
     global voice_command, running
 
-    # =========================================================
-    # 1. 피실험자 신체 정보 직접 입력
-    # =========================================================
     print("\n" + "="*60)
     print(" 🧑‍🔧 피실험자 신체 정보 입력 (엔터키를 누르면 괄호 안의 기본값 적용)")
     print("="*60)
@@ -130,9 +130,6 @@ def main():
 
     print(f"\n [적용 완료] 키: {USER_HEIGHT_CM}cm | 어깨 높이: {USER_SHOULDER_HEIGHT_CM}cm | 상완: {L1_CM}cm | 하완: {L2_CM}cm")
 
-    # =========================================================
-    # 2. 실험 조건 입력
-    # =========================================================
     print("\n" + "="*60)
     for k, v in CONDITIONS.items(): print(f" [{k}] {v['name']}")
     print("="*60)
@@ -181,8 +178,6 @@ def main():
     cycle_avg_rula = 0.0
     user_response_text = ""
     is_approved_rule = False
-
-    # 키보드 입력을 처리하기 위한 변수
     key = -1 
 
     while cap.isOpened() and trial_count < TOTAL_TRIALS_PER_CONDITION:
@@ -207,6 +202,16 @@ def main():
         if current_state == "INIT_START":
             speak(f"[{CURRENT_CONDITION['name']}] 첫 번째 조립 위치로 이동합니다.")
             SendPassGoal({"target_z_mm": current_tighten_z_mm, "msg": "Initial move"})
+            
+            # 💡 최초 위치도 JSON 로그에 남기기
+            coordinate_logs.append({
+                "time": time.strftime('%Y-%m-%d %H:%M:%S'),
+                "trial": 0,
+                "target_z_mm": current_tighten_z_mm
+            })
+            with open(SAVE_FILENAME, "w", encoding="utf-8") as f:
+                json.dump(coordinate_logs, f, indent=4)
+                
             time.sleep(3.0)
             
             with voice_lock: voice_command = None 
@@ -230,12 +235,9 @@ def main():
             kw_list = ["끝", "완료", "다했", "체결", "조립", "다 했", "완료했", "마무리", "오케이"]
             voice_detected = local_voice and any(kw in local_voice for kw in kw_list)
             
-            # 💡 [핵심] 음성이 인식되거나, 연구자가 '스페이스바'를 누르면 완료로 처리!
             if voice_detected or key == ord(' '):
-                if key == ord(' '):
-                    print("[수동 조작 감지]: 스페이스바(완료) 눌림")
-                else:
-                    print(f"[작업 완료 음성 감지]: '{local_voice}'")
+                if key == ord(' '): print("[수동 조작 감지]: 스페이스바(완료) 눌림")
+                else: print(f"[작업 완료 음성 감지]: '{local_voice}'")
                 current_state = "RELEASE_BLOCK"
 
         elif current_state == "RELEASE_BLOCK":
@@ -263,18 +265,18 @@ def main():
             user_response_text = ""
             is_approved_rule = False
 
-            if control_type == "none":
+            if control_type == "None":
                 speak("비개입 조건이므로 기존 높이를 그대로 유지합니다.")
                 is_approved_rule = False
                 current_state = "APPLY_NEXT_TARGET"
             else:
                 if is_risky:
-                    if lead_type == "시스템":
+                    if lead_type == "System":
                         speak("방금 전 위험 자세가 감지되어 시스템이 다음 높이를 보정합니다.")
                         metrics["system_intervention_count"] += 1
                         is_approved_rule = True
                         current_state = "APPLY_NEXT_TARGET"
-                    elif lead_type == "작업자":
+                    elif lead_type == "Worker":
                         speak("방금 전 자세 불편이 감지되었습니다. 높이 조정을 진행할까요?")
                         with voice_lock: voice_command = None 
                         wait_start_time = time.time()
@@ -293,23 +295,22 @@ def main():
                     user_response_text = voice_command
                     voice_command = None
             
-            # 💡 [핵심] 음성 인식이 안될 때 키보드로 직접 승인/거절 입력 가능
             manual_yes = (key == ord('y') or key == ord('Y'))
             manual_no = (key == ord('n') or key == ord('N'))
             
             if user_response_text or elapsed_wait > 5.0 or manual_yes or manual_no:
                 if manual_yes:
-                    user_response_text = "응 올려줘 (수동입력)"
+                    user_response_text = "Yes, please adjust (Manual)"
                     print("[수동 조작 감지]: Y 키 (조정 승인)")
                 elif manual_no:
-                    user_response_text = "아니 그냥 둬 (수동입력)"
+                    user_response_text = "No, keep it (Manual)"
                     print("[수동 조작 감지]: N 키 (조정 거절)")
                 elif user_response_text: 
                     print(f"[작업자 답변]: '{user_response_text}'")
                 else: 
                     print("[대답 없음] 기본값으로 진행합니다.")
                 
-                if CURRENT_CONDITION["control"] != "llm":
+                if CURRENT_CONDITION["control"] != "LLM":
                     if manual_yes: is_approved_rule = True
                     elif manual_no: is_approved_rule = False
                     else:
@@ -325,7 +326,8 @@ def main():
             cycle_durations.append(cycle_duration)
 
             if not user_response_text:
-                user_response_text = f"평균 어깨 각도 {cycle_avg_sh:.1f}도로 체결함"
+                # 💡 기본 응답 텍스트도 영어로 변경
+                user_response_text = f"Tightened with avg shoulder {cycle_avg_sh:.1f} deg"
 
             llm_start_time = time.time()
             llm_result = experiment_controller.run_task(
@@ -335,7 +337,7 @@ def main():
                 user_voice_text=user_response_text, is_approved_rule=is_approved_rule
             )
             latency = time.time() - llm_start_time
-            if CURRENT_CONDITION["control"] == "llm": llm_latencies.append(latency)
+            if CURRENT_CONDITION["control"] == "LLM": llm_latencies.append(latency)
             
             next_target_z_m = llm_result.get("final_z_m", current_tighten_z_mm / 1000.0)
             next_target_z_mm = next_target_z_m * 1000.0
@@ -351,8 +353,18 @@ def main():
             
             SendPassGoal({"target_z_mm": current_tighten_z_mm, "msg": f"Trial {trial_count} Setup"})
             
+            # 💡 [핵심 추가] 로봇 전송용 좌표 JSON 파일 기록 업데이트
+            coordinate_logs.append({
+                "time": time.strftime('%Y-%m-%d %H:%M:%S'),
+                "trial": trial_count,
+                "target_z_mm": current_tighten_z_mm
+            })
+            with open(SAVE_FILENAME, "w", encoding="utf-8") as f:
+                json.dump(coordinate_logs, f, indent=4)
+            
+            # 💡 엑셀 깨짐 방지를 위해 인코딩을 "utf-8-sig" (BOM 포함)으로 변경
             raw_file_exists = os.path.isfile(RAW_CSV_FILENAME)
-            with open(RAW_CSV_FILENAME, "a", encoding="utf-8") as f:
+            with open(RAW_CSV_FILENAME, "a", encoding="utf-8-sig") as f:
                 if not raw_file_exists: f.write("Time,Condition,Trial_Num,Lead_Type,Control_Type,Avg_Shoulder,Avg_Elbow,RULA,User_Voice,Final_Z_m,Is_Approved,LLM_Latency_s,Is_Invalid\n")
                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')},{CURRENT_CONDITION['name']},{trial_count},"
                         f"{CURRENT_CONDITION['lead']},{CURRENT_CONDITION['control']},{cycle_avg_sh:.1f},{cycle_avg_elb:.1f},"
@@ -373,13 +385,10 @@ def main():
         cv2.putText(frame, f"Trial: {trial_count}/{TOTAL_TRIALS_PER_CONDITION}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         cv2.putText(frame, f"Live RULA: {current_rula}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
         cv2.putText(frame, f"Shoulder Angle: {shoulder_ang:.1f} deg", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        
-        # 화면 하단에 연구자용 키보드 조작 가이드 띄우기
         cv2.putText(frame, "[Manual Override] SPACE: Done | Y: Yes | N: No", (20, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 200), 2)
         
         cv2.imshow("HRI Ergonomic Bolt Fastening Task", frame)
         
-        # 💡 키보드 입력값을 저장 (다음 프레임의 루프 시작 시 반영됨)
         key = cv2.waitKey(10) & 0xFF
         if key == 27: break
 
@@ -396,8 +405,9 @@ def main():
     print(f"📊 [{CURRENT_CONDITION['name']}] 매트릭스 추출 완료")
     print("="*60)
     
+    # 💡 종합 Summary도 엑셀 호환을 위해 utf-8-sig 적용
     file_exists = os.path.isfile(SUMMARY_FILENAME)
-    with open(SUMMARY_FILENAME, "a", encoding="utf-8") as f:
+    with open(SUMMARY_FILENAME, "a", encoding="utf-8-sig") as f:
         if not file_exists:
             f.write("Condition,Completed_Transfers,Avg_Task_Time_s,Avg_RULA,Risky_Time_s,System_Interventions,Adjust_Count,Avg_Adj_mm,Correction_Cmds,Invalid_Cmds,Avg_LLM_Latency_s\n")
         f.write(f"{CURRENT_CONDITION['name']},{metrics['completed_transfers']},{avg_cycle_time:.2f},{avg_rula:.2f},"
