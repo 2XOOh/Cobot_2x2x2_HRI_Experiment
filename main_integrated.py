@@ -24,7 +24,7 @@ from real_robot_gripper_source import start_real_robot_gripper_listener
 # =========================================================
 # API 및 환경 설정
 # =========================================================
-OPENAI_API_KEY = "apikey"
+OPENAI_API_KEY = "apikey" # ⚠️ 여기에 실제 Groq API 키를 다시 입력하세요!
 LLAMA_BASE_URL = "https://api.groq.com/openai/v1" 
 
 TOTAL_TRIALS_PER_CONDITION = 10 # 10회 통제
@@ -59,17 +59,22 @@ def speak(text):
         engine.runAndWait()
     threading.Thread(target=_speak, daemon=True).start()
 
+# 💡 마이크 인식 딜레이 완벽 제거 (노이즈 필터링 끔, 감도 고정)
 def speech_recognition_thread():
     global voice_command
     recognizer = sr.Recognizer()
-    microphone = sr.Microphone()
+    recognizer.energy_threshold = 300       # 감도 고정 (낮을수록 작은 소리도 다 잡음)
+    recognizer.dynamic_energy_threshold = False # 동적 딜레이 끄기
+    recognizer.pause_threshold = 0.5        # 말이 끝나는 기준을 0.5초로 짧게 잡아 즉각 반응
     
-    print("[STT] 음성 인식 대기 중...")
-    while running:
-        with microphone as source:
-            recognizer.adjust_for_ambient_noise(source, duration=0.2)
+    microphone = sr.Microphone()
+    print("[STT] 마이크 상시 대기 모드 켜짐 (노이즈 필터링 없이 즉각 반응)")
+    
+    with microphone as source:
+        while running:
             try:
-                audio = recognizer.listen(source, timeout=1.0, phrase_time_limit=4.0)
+                # 딜레이 없이 소리가 들리면 바로 캡처 (최대 3초까지만 듣기)
+                audio = recognizer.listen(source, timeout=1.0, phrase_time_limit=3.0)
                 text = recognizer.recognize_google(audio, language="ko-KR")
                 print(f"🗣️ [음성 인식]: '{text}'")
                 with voice_lock:
@@ -98,7 +103,7 @@ def main():
     global voice_command, running
 
     # =========================================================
-    # 💡 1. 피실험자 신체 정보 직접 입력
+    # 1. 피실험자 신체 정보 직접 입력
     # =========================================================
     print("\n" + "="*60)
     print(" 🧑‍🔧 피실험자 신체 정보 입력 (엔터키를 누르면 괄호 안의 기본값 적용)")
@@ -110,7 +115,6 @@ def main():
     except: USER_HEIGHT_CM = 175.0
     
     try:
-        # 어깨 높이 미입력시 키에서 30cm 뺀 값을 추천값으로 띄움
         default_sh = USER_HEIGHT_CM - 30.0
         in_sh = input(f" 2. 어깨까지의 높이 (cm) [기본: {default_sh}]: ")
         USER_SHOULDER_HEIGHT_CM = float(in_sh) if in_sh.strip() else default_sh
@@ -142,7 +146,6 @@ def main():
     stt_thread.start()
     start_real_robot_gripper_listener(gripper_open_event)
 
-    # 💡 3. 입력받은 신체 정보를 물리 계산기(IK Manager)에 전달
     ik_manager = RobotIKManager(h_shoulder_cm=USER_SHOULDER_HEIGHT_CM, l1_cm=L1_CM, l2_cm=L2_CM, current_pass_floor_z_cm=DEFAULT_PASS_FLOOR_Z_CM)
     experiment_controller = PickAndPlaceExperiment(api_key=OPENAI_API_KEY, base_url=LLAMA_BASE_URL)
 
@@ -168,7 +171,6 @@ def main():
     cycle_start_time = time.time()
     wait_start_time = 0.0
     
-    # 💡 4. 로봇 원점 높이 계산 (입력받은 키의 1.1배)
     ORIGIN_Z_MM = USER_HEIGHT_CM * 1.1 * 10.0 
     current_tighten_z_mm = DEFAULT_PASS_FLOOR_Z_CM * 10.0
 
@@ -224,7 +226,9 @@ def main():
                     local_voice = voice_command
                     voice_command = None
             
-            if local_voice and any(kw in local_voice for kw in ["끝", "완료", "다했", "체결", "조립"]):
+            # 💡 작업자 음성 키워드 확장 및 즉시 반응 확인
+            kw_list = ["끝", "완료", "다했", "체결", "조립", "다 했", "완료했", "마무리", "오케이"]
+            if local_voice and any(kw in local_voice for kw in kw_list):
                 print(f"[작업 완료 음성 감지]: '{local_voice}'")
                 current_state = "RELEASE_BLOCK"
 
@@ -276,7 +280,7 @@ def main():
 
         elif current_state == "WAIT_ADJUST_ANSWER":
             elapsed_wait = time.time() - wait_start_time
-            cv2.putText(frame, f"Waiting Answer... {5.0 - elapsed_wait:.1f}s", (20, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
+            cv2.putText(frame, f"Waiting Answer... {5.0 - elapsed_wait:.1f}s", (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
             
             with voice_lock:
                 if voice_command:
@@ -344,9 +348,11 @@ def main():
             else:
                 current_state = "END_EXPERIMENT"
         
+        # 💡 화면 모니터링 텍스트 출력 (어깨 각도 추가)
         cv2.putText(frame, f"State: {current_state}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, f"Trial: {trial_count}/{TOTAL_TRIALS_PER_CONDITION}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         cv2.putText(frame, f"Live RULA: {current_rula}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(frame, f"Shoulder Angle: {shoulder_ang:.1f} deg", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2) # 어깨 각도 노란색 표시
         cv2.imshow("HRI Ergonomic Bolt Fastening Task", frame)
         
         if cv2.waitKey(10) & 0xFF == 27: break
@@ -373,7 +379,7 @@ def main():
                 f"{metrics['robot_adjustment_count']},{avg_adj_mm:.1f},{metrics['correction_commands_count']},"
                 f"{metrics['invalid_cmds']},{avg_llm_latency:.2f}\n")
     
-    speak("수고하셨습니다. 실험이 종료되었습니다.")
+    speak("수고하셨습니다. 모든 실험 지표가 엑셀로 추출되었습니다.")
 
 if __name__ == "__main__":
     main()
