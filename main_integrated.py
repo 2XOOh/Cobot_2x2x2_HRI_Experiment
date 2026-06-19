@@ -59,13 +59,12 @@ def speak(text):
         engine.runAndWait()
     threading.Thread(target=_speak, daemon=True).start()
 
-# 💡 마이크 인식 딜레이 완벽 제거 (노이즈 필터링 끔, 감도 고정)
 def speech_recognition_thread():
     global voice_command
     recognizer = sr.Recognizer()
-    recognizer.energy_threshold = 300       # 감도 고정 (낮을수록 작은 소리도 다 잡음)
-    recognizer.dynamic_energy_threshold = False # 동적 딜레이 끄기
-    recognizer.pause_threshold = 0.5        # 말이 끝나는 기준을 0.5초로 짧게 잡아 즉각 반응
+    recognizer.energy_threshold = 300       
+    recognizer.dynamic_energy_threshold = False 
+    recognizer.pause_threshold = 0.5        
     
     microphone = sr.Microphone()
     print("[STT] 마이크 상시 대기 모드 켜짐 (노이즈 필터링 없이 즉각 반응)")
@@ -73,7 +72,6 @@ def speech_recognition_thread():
     with microphone as source:
         while running:
             try:
-                # 딜레이 없이 소리가 들리면 바로 캡처 (최대 3초까지만 듣기)
                 audio = recognizer.listen(source, timeout=1.0, phrase_time_limit=3.0)
                 text = recognizer.recognize_google(audio, language="ko-KR")
                 print(f"🗣️ [음성 인식]: '{text}'")
@@ -184,6 +182,9 @@ def main():
     user_response_text = ""
     is_approved_rule = False
 
+    # 키보드 입력을 처리하기 위한 변수
+    key = -1 
+
     while cap.isOpened() and trial_count < TOTAL_TRIALS_PER_CONDITION:
         ret, frame = cap.read()
         if not ret: break
@@ -226,10 +227,15 @@ def main():
                     local_voice = voice_command
                     voice_command = None
             
-            # 💡 작업자 음성 키워드 확장 및 즉시 반응 확인
             kw_list = ["끝", "완료", "다했", "체결", "조립", "다 했", "완료했", "마무리", "오케이"]
-            if local_voice and any(kw in local_voice for kw in kw_list):
-                print(f"[작업 완료 음성 감지]: '{local_voice}'")
+            voice_detected = local_voice and any(kw in local_voice for kw in kw_list)
+            
+            # 💡 [핵심] 음성이 인식되거나, 연구자가 '스페이스바'를 누르면 완료로 처리!
+            if voice_detected or key == ord(' '):
+                if key == ord(' '):
+                    print("[수동 조작 감지]: 스페이스바(완료) 눌림")
+                else:
+                    print(f"[작업 완료 음성 감지]: '{local_voice}'")
                 current_state = "RELEASE_BLOCK"
 
         elif current_state == "RELEASE_BLOCK":
@@ -287,13 +293,28 @@ def main():
                     user_response_text = voice_command
                     voice_command = None
             
-            if user_response_text or elapsed_wait > 5.0:
-                if user_response_text: print(f"[작업자 답변]: '{user_response_text}'")
-                else: print("[대답 없음] 기본값으로 진행합니다.")
+            # 💡 [핵심] 음성 인식이 안될 때 키보드로 직접 승인/거절 입력 가능
+            manual_yes = (key == ord('y') or key == ord('Y'))
+            manual_no = (key == ord('n') or key == ord('N'))
+            
+            if user_response_text or elapsed_wait > 5.0 or manual_yes or manual_no:
+                if manual_yes:
+                    user_response_text = "응 올려줘 (수동입력)"
+                    print("[수동 조작 감지]: Y 키 (조정 승인)")
+                elif manual_no:
+                    user_response_text = "아니 그냥 둬 (수동입력)"
+                    print("[수동 조작 감지]: N 키 (조정 거절)")
+                elif user_response_text: 
+                    print(f"[작업자 답변]: '{user_response_text}'")
+                else: 
+                    print("[대답 없음] 기본값으로 진행합니다.")
                 
                 if CURRENT_CONDITION["control"] != "llm":
-                    pos_kws = ["응", "어", "네", "예", "조정", "해줘", "맞아", "오케이", "ok", "좋아"]
-                    is_approved_rule = any(kw in user_response_text.replace(" ", "") for kw in pos_kws)
+                    if manual_yes: is_approved_rule = True
+                    elif manual_no: is_approved_rule = False
+                    else:
+                        pos_kws = ["응", "어", "네", "예", "조정", "해줘", "맞아", "오케이", "ok", "좋아"]
+                        is_approved_rule = any(kw in user_response_text.replace(" ", "") for kw in pos_kws)
                 current_state = "APPLY_NEXT_TARGET"
 
         elif current_state == "APPLY_NEXT_TARGET":
@@ -348,14 +369,19 @@ def main():
             else:
                 current_state = "END_EXPERIMENT"
         
-        # 💡 화면 모니터링 텍스트 출력 (어깨 각도 추가)
         cv2.putText(frame, f"State: {current_state}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, f"Trial: {trial_count}/{TOTAL_TRIALS_PER_CONDITION}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
         cv2.putText(frame, f"Live RULA: {current_rula}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        cv2.putText(frame, f"Shoulder Angle: {shoulder_ang:.1f} deg", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2) # 어깨 각도 노란색 표시
+        cv2.putText(frame, f"Shoulder Angle: {shoulder_ang:.1f} deg", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        
+        # 화면 하단에 연구자용 키보드 조작 가이드 띄우기
+        cv2.putText(frame, "[Manual Override] SPACE: Done | Y: Yes | N: No", (20, 450), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 200), 2)
+        
         cv2.imshow("HRI Ergonomic Bolt Fastening Task", frame)
         
-        if cv2.waitKey(10) & 0xFF == 27: break
+        # 💡 키보드 입력값을 저장 (다음 프레임의 루프 시작 시 반영됨)
+        key = cv2.waitKey(10) & 0xFF
+        if key == 27: break
 
     running = False
     cap.release()
@@ -379,7 +405,7 @@ def main():
                 f"{metrics['robot_adjustment_count']},{avg_adj_mm:.1f},{metrics['correction_commands_count']},"
                 f"{metrics['invalid_cmds']},{avg_llm_latency:.2f}\n")
     
-    speak("수고하셨습니다. 모든 실험 지표가 엑셀로 추출되었습니다.")
+    speak("수고하셨습니다. 실험이 종료되었습니다.")
 
 if __name__ == "__main__":
     main()
