@@ -239,7 +239,7 @@ def main():
         elif current_state == "EVALUATE_POSTURE":
             lead_type = CURRENT_CONDITION["lead"]
             control_type = CURRENT_CONDITION["control"]
-            is_risky = (cycle_avg_sh >= 45.0) 
+            is_risky = (cycle_avg_sh >= 90.0) 
             
             user_response_text = ""
             is_approved_rule = False
