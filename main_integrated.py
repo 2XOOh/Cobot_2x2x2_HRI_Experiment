@@ -8,6 +8,7 @@ import speech_recognition as sr
 import socket                   
 import threading                
 import math
+from datetime import datetime  # 💡 실시간 밀리초 단위 로깅을 위해 추가
 
 try:
     from mediapipe.python.solutions import pose as mp_pose
@@ -24,7 +25,7 @@ from real_robot_gripper_source import start_real_robot_gripper_listener
 # =========================================================
 # API 및 환경 설정
 # =========================================================
-OPENAI_API_KEY = "apikey" # ⚠️ 여기에 실제 Groq API 키를 입력하세요.
+OPENAI_API_KEY = "apikey" # ⚠️ 여기에 실제 Groq API 키를 다시 입력하세요!
 LLAMA_BASE_URL = "https://api.groq.com/openai/v1" 
 
 TOTAL_TRIALS_PER_CONDITION = 10 
@@ -38,6 +39,9 @@ os.makedirs(RESULT_DIR, exist_ok=True)
 SAVE_FILENAME = os.path.join(RESULT_DIR, "experiment_log_detailed.json")
 SUMMARY_FILENAME = os.path.join(RESULT_DIR, "experiment_summary_matrix.csv")
 RAW_CSV_FILENAME = os.path.join(RESULT_DIR, "experiment_raw_data_per_trial.csv")
+
+# 💡 [새로 추가된 진짜 로우데이터 저장 파일]
+TRUE_RAW_CSV_FILENAME = os.path.join(RESULT_DIR, "experiment_time_series_raw.csv")
 
 CONDITIONS = {
     1: {"intervention": "Intervention", "lead": "System", "control": "LLM", "name": "Cond1_Sys_LLM"},
@@ -161,8 +165,7 @@ def main():
     
     ORIGIN_Z_MM = USER_HEIGHT_CM * 1.1 * 10.0 
     
-    # 💡 [핵심] 어깨 180도, 팔을 위로 쭉 뻗었을 때의 초기 높이 계산 로직 적용 (안전 한계치 적용)
-    # 계산식: Z = 어깨높이 - (상완 + 하완) * cos(180도)
+    # 어깨 180도, 팔을 위로 쭉 뻗었을 때의 초기 높이 계산 로직 적용 (안전 한계치 적용)
     initial_calc_z_mm = (USER_SHOULDER_HEIGHT_CM * 10) - (L1_CM * 10 + L2_CM * 10) * math.cos(math.radians(180.0))
     current_tighten_z_mm = min(MAX_HARDWARE_Z_MM, initial_calc_z_mm)
     print(f"\n[초기 세팅] 어깨 180도 기준 목표 높이: {initial_calc_z_mm:.1f} mm")
@@ -178,6 +181,12 @@ def main():
     user_response_text = ""
     is_approved_rule = False
     key = -1 
+
+    # 💡 [핵심] 초당 30번씩 찍힐 진짜 로우데이터 파일 열기 준비
+    true_raw_exists = os.path.isfile(TRUE_RAW_CSV_FILENAME)
+    f_raw = open(TRUE_RAW_CSV_FILENAME, "a", encoding="utf-8-sig")
+    if not true_raw_exists:
+        f_raw.write("Timestamp,Condition,Trial_Num,State,Shoulder_Angle,Elbow_Angle,Current_RULA,Robot_Target_Z_mm\n")
 
     while cap.isOpened() and trial_count < TOTAL_TRIALS_PER_CONDITION:
         ret, frame = cap.read()
@@ -197,6 +206,10 @@ def main():
             elbow_ang = calculate_angle(shoulder, elbow, wrist)
             current_rula = estimate_rula_score(shoulder_ang, elbow_ang)
             if current_rula >= 4: metrics["risky_posture_time_sec"] += 0.1
+
+        # 💡 [핵심] 매 프레임마다 시간, 각도, 현재 상태를 CSV에 밀어넣음 (이게 교수님이 원하시는 진짜 데이터!)
+        current_time_ms = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        f_raw.write(f"{current_time_ms},{CURRENT_CONDITION['name']},{trial_count},{current_state},{shoulder_ang:.2f},{elbow_ang:.2f},{current_rula},{current_tighten_z_mm:.1f}\n")
 
         if current_state == "INIT_START":
             speak(f"[{CURRENT_CONDITION['name']}] 어깨 각도 180도 기준 초기 조립 위치로 이동합니다.")
@@ -256,15 +269,13 @@ def main():
         elif current_state == "EVALUATE_POSTURE":
             lead_type = CURRENT_CONDITION["lead"]
             control_type = CURRENT_CONDITION["control"]
-            
-            # 💡 [핵심] 위험 각도 임계값을 130도로 상향!
             is_risky = (cycle_avg_sh >= 130.0)
             
             user_response_text = ""
             is_approved_rule = False
 
             if control_type == "None":
-                speak("비개입 조건이므로 기존 높이를 그대로 유지합니다.")
+                speak("비개입 조건이므로 기존 높호를 그대로 유지합니다.")
                 is_approved_rule = False
                 current_state = "APPLY_NEXT_TARGET"
             else:
@@ -326,7 +337,6 @@ def main():
             if not user_response_text:
                 user_response_text = f"Tightened with avg shoulder {cycle_avg_sh:.1f} deg"
 
-            # 💡 [핵심] Rule-based 목표 높이 사전 계산 (어깨 20도 하향, 팔꿈치 0도 고정 가정)
             target_sh_angle_for_rule = cycle_avg_sh - 20.0
             recommended_z_mm = (USER_SHOULDER_HEIGHT_CM * 10) - (L1_CM * 10 + L2_CM * 10) * math.cos(math.radians(target_sh_angle_for_rule))
 
@@ -340,7 +350,6 @@ def main():
             latency = time.time() - llm_start_time
             if CURRENT_CONDITION["control"] == "LLM": llm_latencies.append(latency)
             
-            # 💡 비상 정지 및 재질문 기능 연동
             if llm_result.get("is_emergency_stop"):
                 speak("위험 상황이 감지되었습니다. 로봇 시스템을 비상 정지합니다.")
                 print("🚨 [LLM 결정] 비상 정지(Emergency Stop) 작동!")
@@ -398,6 +407,9 @@ def main():
         key = cv2.waitKey(10) & 0xFF
         if key == 27: break
 
+    # 💡 루프가 끝나면 찐 로우데이터 파일도 안전하게 닫아줍니다.
+    f_raw.close()
+    
     running = False
     cap.release()
     cv2.destroyAllWindows()
@@ -420,7 +432,7 @@ def main():
                 f"{metrics['robot_adjustment_count']},{avg_adj_mm:.1f},{metrics['correction_commands_count']},"
                 f"{metrics['invalid_cmds']},{avg_llm_latency:.2f}\n")
     
-    speak("수고하셨습니다. 실험이 종료되었습니다.")
+    speak("수고하셨습니다. 실험이 완료되었습니다.")
 
 if __name__ == "__main__":
     main()
