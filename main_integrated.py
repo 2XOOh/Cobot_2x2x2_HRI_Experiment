@@ -29,7 +29,9 @@ LLAMA_BASE_URL = "https://api.groq.com/openai/v1"
 
 TOTAL_TRIALS_PER_CONDITION = 10 
 
-DEFAULT_PASS_FLOOR_Z_CM = 135.5
+# 로봇 하드웨어 안전 한계치 (LINK0 634mm + 로봇 최대 한계 1200mm)
+MAX_HARDWARE_Z_MM = 1834.0 
+
 RESULT_DIR = os.path.join(os.path.dirname(__file__), "results")
 os.makedirs(RESULT_DIR, exist_ok=True)
 
@@ -37,7 +39,6 @@ SAVE_FILENAME = os.path.join(RESULT_DIR, "experiment_log_detailed.json")
 SUMMARY_FILENAME = os.path.join(RESULT_DIR, "experiment_summary_matrix.csv")
 RAW_CSV_FILENAME = os.path.join(RESULT_DIR, "experiment_raw_data_per_trial.csv")
 
-# 💡 조건명 및 변수를 모두 영어로 수정했습니다.
 CONDITIONS = {
     1: {"intervention": "Intervention", "lead": "System", "control": "LLM", "name": "Cond1_Sys_LLM"},
     2: {"intervention": "Intervention", "lead": "System", "control": "Rule", "name": "Cond2_Sys_Rule"},
@@ -50,8 +51,6 @@ gripper_open_event = threading.Event()
 voice_command = None
 voice_lock = threading.Lock()
 running = True
-
-# 로봇에게 전달할 좌표와 시간을 담을 리스트 (JSON용)
 coordinate_logs = []
 
 def speak(text):
@@ -141,21 +140,15 @@ def main():
     stt_thread.start()
     start_real_robot_gripper_listener(gripper_open_event)
 
-    ik_manager = RobotIKManager(h_shoulder_cm=USER_SHOULDER_HEIGHT_CM, l1_cm=L1_CM, l2_cm=L2_CM, current_pass_floor_z_cm=DEFAULT_PASS_FLOOR_Z_CM)
     experiment_controller = PickAndPlaceExperiment(api_key=OPENAI_API_KEY, base_url=LLAMA_BASE_URL)
 
     cap = cv2.VideoCapture(0)
     mp_pose_instance = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
 
     metrics = {
-        "completed_transfers": 0,
-        "total_rula_score": 0,
-        "risky_posture_time_sec": 0,
-        "system_intervention_count": 0,
-        "robot_adjustment_count": 0,
-        "total_adjustment_magnitude_mm": 0.0,
-        "correction_commands_count": 0,
-        "invalid_cmds": 0 
+        "completed_transfers": 0, "total_rula_score": 0, "risky_posture_time_sec": 0,
+        "system_intervention_count": 0, "robot_adjustment_count": 0,
+        "total_adjustment_magnitude_mm": 0.0, "correction_commands_count": 0, "invalid_cmds": 0 
     }
     
     cycle_durations = []
@@ -167,7 +160,13 @@ def main():
     wait_start_time = 0.0
     
     ORIGIN_Z_MM = USER_HEIGHT_CM * 1.1 * 10.0 
-    current_tighten_z_mm = DEFAULT_PASS_FLOOR_Z_CM * 10.0
+    
+    # 💡 [핵심] 어깨 180도, 팔을 위로 쭉 뻗었을 때의 초기 높이 계산 로직 적용 (안전 한계치 적용)
+    # 계산식: Z = 어깨높이 - (상완 + 하완) * cos(180도)
+    initial_calc_z_mm = (USER_SHOULDER_HEIGHT_CM * 10) - (L1_CM * 10 + L2_CM * 10) * math.cos(math.radians(180.0))
+    current_tighten_z_mm = min(MAX_HARDWARE_Z_MM, initial_calc_z_mm)
+    print(f"\n[초기 세팅] 어깨 180도 기준 목표 높이: {initial_calc_z_mm:.1f} mm")
+    print(f"           (로봇 보호를 위해 실제 세팅된 높이: {current_tighten_z_mm:.1f} mm)\n")
 
     accumulated_shoulder_angles = []
     accumulated_elbow_angles = []
@@ -200,14 +199,11 @@ def main():
             if current_rula >= 4: metrics["risky_posture_time_sec"] += 0.1
 
         if current_state == "INIT_START":
-            speak(f"[{CURRENT_CONDITION['name']}] 첫 번째 조립 위치로 이동합니다.")
+            speak(f"[{CURRENT_CONDITION['name']}] 어깨 각도 180도 기준 초기 조립 위치로 이동합니다.")
             SendPassGoal({"target_z_mm": current_tighten_z_mm, "msg": "Initial move"})
             
-            # 💡 최초 위치도 JSON 로그에 남기기
             coordinate_logs.append({
-                "time": time.strftime('%Y-%m-%d %H:%M:%S'),
-                "trial": 0,
-                "target_z_mm": current_tighten_z_mm
+                "time": time.strftime('%Y-%m-%d %H:%M:%S'), "trial": 0, "target_z_mm": current_tighten_z_mm
             })
             with open(SAVE_FILENAME, "w", encoding="utf-8") as f:
                 json.dump(coordinate_logs, f, indent=4)
@@ -215,7 +211,7 @@ def main():
             time.sleep(3.0)
             
             with voice_lock: voice_command = None 
-            speak("블록의 네 개 구멍에 볼트를 체결해 주세요.")
+            speak("블록의 다섯 개 구멍에 볼트를 체결해 주세요.")
             current_state = "BOLT_TIGHTENING"
             cycle_start_time = time.time()
             accumulated_shoulder_angles.clear(); accumulated_elbow_angles.clear(); accumulated_rula_scores.clear()
@@ -260,7 +256,9 @@ def main():
         elif current_state == "EVALUATE_POSTURE":
             lead_type = CURRENT_CONDITION["lead"]
             control_type = CURRENT_CONDITION["control"]
-            is_risky = (cycle_avg_sh >= 90.0)
+            
+            # 💡 [핵심] 위험 각도 임계값을 130도로 상향!
+            is_risky = (cycle_avg_sh >= 130.0)
             
             user_response_text = ""
             is_approved_rule = False
@@ -272,7 +270,7 @@ def main():
             else:
                 if is_risky:
                     if lead_type == "System":
-                        speak("방금 전 위험 자세가 감지되어 시스템이 다음 높이를 보정합니다.")
+                        speak("방금 전 130도 이상의 위험 자세가 감지되어 시스템이 다음 높이를 보정합니다.")
                         metrics["system_intervention_count"] += 1
                         is_approved_rule = True
                         current_state = "APPLY_NEXT_TARGET"
@@ -326,18 +324,31 @@ def main():
             cycle_durations.append(cycle_duration)
 
             if not user_response_text:
-                # 💡 기본 응답 텍스트도 영어로 변경
                 user_response_text = f"Tightened with avg shoulder {cycle_avg_sh:.1f} deg"
+
+            # 💡 [핵심] Rule-based 목표 높이 사전 계산 (어깨 20도 하향, 팔꿈치 0도 고정 가정)
+            target_sh_angle_for_rule = cycle_avg_sh - 20.0
+            recommended_z_mm = (USER_SHOULDER_HEIGHT_CM * 10) - (L1_CM * 10 + L2_CM * 10) * math.cos(math.radians(target_sh_angle_for_rule))
 
             llm_start_time = time.time()
             llm_result = experiment_controller.run_task(
                 condition=CURRENT_CONDITION, sh_angle=shoulder_ang, avg_sh_angle=cycle_avg_sh,
-                elb_angle=cycle_avg_elb, target_pass_floor_z_mm=current_tighten_z_mm, adj_mm=0.0,
+                elb_angle=cycle_avg_elb, target_pass_floor_z_mm=recommended_z_mm, adj_mm=0.0,
                 current_pass_floor_z_mm=current_tighten_z_mm, h_sh=USER_SHOULDER_HEIGHT_CM * 10, l1=L1_CM * 10, l2=L2_CM * 10,
                 user_voice_text=user_response_text, is_approved_rule=is_approved_rule
             )
             latency = time.time() - llm_start_time
             if CURRENT_CONDITION["control"] == "LLM": llm_latencies.append(latency)
+            
+            # 💡 비상 정지 및 재질문 기능 연동
+            if llm_result.get("is_emergency_stop"):
+                speak("위험 상황이 감지되었습니다. 로봇 시스템을 비상 정지합니다.")
+                print("🚨 [LLM 결정] 비상 정지(Emergency Stop) 작동!")
+                break
+                
+            if llm_result.get("clarification_question"):
+                speak(llm_result["clarification_question"])
+                print(f"❓ [LLM 질문]: {llm_result['clarification_question']}")
             
             next_target_z_m = llm_result.get("final_z_m", current_tighten_z_mm / 1000.0)
             next_target_z_mm = next_target_z_m * 1000.0
@@ -349,20 +360,15 @@ def main():
             if llm_result.get("is_invalid"): metrics["invalid_cmds"] += 1
                 
             current_tighten_z_mm = next_target_z_mm
-            ik_manager.current_pass_floor_z_mm = next_target_z_mm
             
             SendPassGoal({"target_z_mm": current_tighten_z_mm, "msg": f"Trial {trial_count} Setup"})
             
-            # 💡 [핵심 추가] 로봇 전송용 좌표 JSON 파일 기록 업데이트
             coordinate_logs.append({
-                "time": time.strftime('%Y-%m-%d %H:%M:%S'),
-                "trial": trial_count,
-                "target_z_mm": current_tighten_z_mm
+                "time": time.strftime('%Y-%m-%d %H:%M:%S'), "trial": trial_count, "target_z_mm": current_tighten_z_mm
             })
             with open(SAVE_FILENAME, "w", encoding="utf-8") as f:
                 json.dump(coordinate_logs, f, indent=4)
             
-            # 💡 엑셀 깨짐 방지를 위해 인코딩을 "utf-8-sig" (BOM 포함)으로 변경
             raw_file_exists = os.path.isfile(RAW_CSV_FILENAME)
             with open(RAW_CSV_FILENAME, "a", encoding="utf-8-sig") as f:
                 if not raw_file_exists: f.write("Time,Condition,Trial_Num,Lead_Type,Control_Type,Avg_Shoulder,Avg_Elbow,RULA,User_Voice,Final_Z_m,Is_Approved,LLM_Latency_s,Is_Invalid\n")
@@ -371,7 +377,7 @@ def main():
                         f"{cycle_avg_rula:.1f},{user_response_text},{next_target_z_m:.3f},{llm_result.get('is_approved', is_approved_rule)},{latency:.2f},{llm_result.get('is_invalid', False)}\n")
 
             if trial_count < TOTAL_TRIALS_PER_CONDITION:
-                speak(f"{trial_count + 1}번째 작업을 위해 로봇이 하강합니다.")
+                speak(f"{trial_count + 1}번째 작업을 위해 로봇이 이동합니다.")
                 time.sleep(4.0) 
                 
                 with voice_lock: voice_command = None
@@ -405,7 +411,6 @@ def main():
     print(f"📊 [{CURRENT_CONDITION['name']}] 매트릭스 추출 완료")
     print("="*60)
     
-    # 💡 종합 Summary도 엑셀 호환을 위해 utf-8-sig 적용
     file_exists = os.path.isfile(SUMMARY_FILENAME)
     with open(SUMMARY_FILENAME, "a", encoding="utf-8-sig") as f:
         if not file_exists:
