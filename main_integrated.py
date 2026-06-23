@@ -8,7 +8,7 @@ import speech_recognition as sr
 import socket                   
 import threading                
 import math
-from datetime import datetime  # 💡 실시간 밀리초 단위 로깅을 위해 추가
+from datetime import datetime
 
 try:
     from mediapipe.python.solutions import pose as mp_pose
@@ -25,12 +25,11 @@ from real_robot_gripper_source import start_real_robot_gripper_listener
 # =========================================================
 # API 및 환경 설정
 # =========================================================
-OPENAI_API_KEY = "apikey" # ⚠️ 여기에 실제 Groq API 키 확인!
+OPENAI_API_KEY = "apikey" # ⚠️ 실제 Groq API 키
 LLAMA_BASE_URL = "https://api.groq.com/openai/v1" 
 
 TOTAL_TRIALS_PER_CONDITION = 10 
 
-# 로봇 하드웨어 안전 한계치 (LINK0 634mm + 로봇 최대 한계 1200mm)
 MAX_HARDWARE_Z_MM = 1834.0 
 
 RESULT_DIR = os.path.join(os.path.dirname(__file__), "results")
@@ -40,8 +39,8 @@ SAVE_FILENAME = os.path.join(RESULT_DIR, "experiment_log_detailed.json")
 SUMMARY_FILENAME = os.path.join(RESULT_DIR, "experiment_summary_matrix.csv")
 RAW_CSV_FILENAME = os.path.join(RESULT_DIR, "experiment_raw_data_per_trial.csv")
 
-# 💡 실시간 30fps 진짜 로우데이터 저장 파일
-TRUE_RAW_CSV_FILENAME = os.path.join(RESULT_DIR, "experiment_time_series_raw.csv")
+# 💡 [해결] 엑셀 헤더 충돌 방지를 위해 아예 새로운 이름의 파일로 생성 (20열 완벽 보장)
+TRUE_RAW_CSV_FILENAME = os.path.join(RESULT_DIR, "experiment_time_series_raw_3D_final.csv")
 
 CONDITIONS = {
     1: {"intervention": "Intervention", "lead": "System", "control": "LLM", "name": "Cond1_Sys_LLM"},
@@ -69,18 +68,16 @@ def speech_recognition_thread():
     global voice_command, running
     recognizer = sr.Recognizer()
     
-    # 💡 [쌩상태 세팅] 노이즈 필터링 끄고, 아주 작은 소리(150)도 즉각 잡아내게 설정
     recognizer.energy_threshold = 150       
     recognizer.dynamic_energy_threshold = False 
     recognizer.pause_threshold = 0.5        
     
     microphone = sr.Microphone()
-    print("[STT] 마이크 상시 대기 모드 켜짐 (쌩상태 즉각 반응)")
+    print("[STT] 마이크 상시 대기 모드 켜짐 (즉각 반응)")
     
     with microphone as source:
         while running:
             try:
-                # 💡 주변 소음 적응(adjust_for_ambient_noise) 완전 삭제! 딜레이 없이 즉시 듣기
                 audio = recognizer.listen(source, timeout=1.0, phrase_time_limit=3.0)
                 text = recognizer.recognize_google(audio, language="ko-KR")
                 print(f"🗣️ [음성 인식됨]: '{text}'")
@@ -145,7 +142,6 @@ def main():
     except: choice = 1
     CURRENT_CONDITION = CONDITIONS.get(choice, CONDITIONS[1])
 
-    # 💡 STT 스레드 및 로봇 리스너 시작
     stt_thread = threading.Thread(target=speech_recognition_thread, daemon=True)
     stt_thread.start()
     start_real_robot_gripper_listener(gripper_open_event)
@@ -171,7 +167,6 @@ def main():
     
     ORIGIN_Z_MM = USER_HEIGHT_CM * 1.1 * 10.0 
     
-    # 어깨 180도, 팔을 위로 쭉 뻗었을 때의 초기 높이 계산 로직 적용 (안전 한계치 적용)
     initial_calc_z_mm = (USER_SHOULDER_HEIGHT_CM * 10) - (L1_CM * 10 + L2_CM * 10) * math.cos(math.radians(180.0))
     current_tighten_z_mm = min(MAX_HARDWARE_Z_MM, initial_calc_z_mm)
     print(f"\n[초기 세팅] 어깨 180도 기준 목표 높이: {initial_calc_z_mm:.1f} mm")
@@ -188,7 +183,7 @@ def main():
     is_approved_rule = False
     key = -1 
 
-    # 💡 [핵심] 초당 30번씩 찍힐 진짜 로우데이터 파일 열기 준비 (+ 12개 3D 관절 좌표 추가)
+    # 💡 12개 3D 좌표를 포함한 총 20개 항목의 CSV 파일 헤더 생성
     true_raw_exists = os.path.isfile(TRUE_RAW_CSV_FILENAME)
     f_raw = open(TRUE_RAW_CSV_FILENAME, "a", encoding="utf-8-sig")
     if not true_raw_exists:
@@ -205,7 +200,7 @@ def main():
         
         shoulder_ang, elbow_ang, current_rula = 0.0, 0.0, 1
         
-        # 💡 매 프레임 기록할 관절 변수 초기화 (안 보일 땐 0.0)
+        # 💡 매 프레임마다 관절 좌표를 기본값 0.0으로 초기화
         sh_x = sh_y = sh_z = 0.0
         elb_x = elb_y = elb_z = 0.0
         wr_x = wr_y = wr_z = 0.0
@@ -215,11 +210,11 @@ def main():
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
             lm = results.pose_landmarks.landmark
             
-            # Mediapipe가 인식한 3D 좌표(X, Y, Z) 저장
-            sh_x, sh_y, sh_z = lm[12].x, lm[12].y, lm[12].z
-            elb_x, elb_y, elb_z = lm[14].x, lm[14].y, lm[14].z
-            wr_x, wr_y, wr_z = lm[16].x, lm[16].y, lm[16].z
-            hip_x, hip_y, hip_z = lm[24].x, lm[24].y, lm[24].z
+            # 💡 [확인] 4개 주요 관절의 3D(X,Y,Z) 좌표 12개 완벽 추출
+            sh_x, sh_y, sh_z = lm[12].x, lm[12].y, lm[12].z       # 어깨
+            elb_x, elb_y, elb_z = lm[14].x, lm[14].y, lm[14].z    # 팔꿈치
+            wr_x, wr_y, wr_z = lm[16].x, lm[16].y, lm[16].z       # 손목
+            hip_x, hip_y, hip_z = lm[24].x, lm[24].y, lm[24].z    # 골반
 
             shoulder_pt, elbow_pt, wrist_pt, hip_pt = [lm[12].x, lm[12].y], [lm[14].x, lm[14].y], [lm[16].x, lm[16].y], [lm[24].x, lm[24].y]
             shoulder_ang = calculate_angle(hip_pt, shoulder_pt, elbow_pt)
@@ -227,12 +222,13 @@ def main():
             current_rula = estimate_rula_score(shoulder_ang, elbow_ang)
             if current_rula >= 4: metrics["risky_posture_time_sec"] += 0.1
 
-        # 💡 매 프레임마다 시간, 상태, 각도 + 관절 3D 좌표(12개) 전부 기록!
+        # 💡 [확인] 매 프레임 시간, 상태, 각도 + 관절 3D 좌표 12개 실시간 기록 (총 20개 컬럼 일치)
         current_time_ms = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         f_raw.write(f"{current_time_ms},{CURRENT_CONDITION['name']},{trial_count},{current_state},"
                     f"{shoulder_ang:.2f},{elbow_ang:.2f},{current_rula},{current_tighten_z_mm:.1f},"
                     f"{sh_x:.4f},{sh_y:.4f},{sh_z:.4f},{elb_x:.4f},{elb_y:.4f},{elb_z:.4f},"
                     f"{wr_x:.4f},{wr_y:.4f},{wr_z:.4f},{hip_x:.4f},{hip_y:.4f},{hip_z:.4f}\n")
+        f_raw.flush() # 파일이 즉시 저장되도록 flush 추가
 
         if current_state == "INIT_START":
             speak(f"[{CURRENT_CONDITION['name']}] 어깨 각도 180도 기준 초기 조립 위치로 이동합니다.")
@@ -292,6 +288,8 @@ def main():
         elif current_state == "EVALUATE_POSTURE":
             lead_type = CURRENT_CONDITION["lead"]
             control_type = CURRENT_CONDITION["control"]
+            
+            # 💡 [롤백 완료] 작업 중 130도를 넘는 최대치 감지를 제거하고, 기존처럼 '평균 어깨 각도'로만 판단합니다.
             is_risky = (cycle_avg_sh >= 130.0)
             
             user_response_text = ""
@@ -322,7 +320,6 @@ def main():
             elapsed_wait = time.time() - wait_start_time
             cv2.putText(frame, f"Waiting Answer... {5.0 - elapsed_wait:.1f}s", (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
             
-            # 💡 [핵심] 여기서 다시 마이크를 켜지 않고 백그라운드 STT가 들은 것만 가져옵니다! (마이크 충돌 방지)
             local_voice = None
             with voice_lock:
                 if voice_command:
@@ -433,7 +430,6 @@ def main():
         key = cv2.waitKey(10) & 0xFF
         if key == 27: break
 
-    # 💡 찐 로우데이터 파일도 안전하게 닫아줍니다.
     f_raw.close()
     
     running = False
