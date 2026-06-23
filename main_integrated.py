@@ -25,7 +25,7 @@ from real_robot_gripper_source import start_real_robot_gripper_listener
 # =========================================================
 # API 및 환경 설정
 # =========================================================
-OPENAI_API_KEY = "apikey" # ⚠️ 여기에 실제 Groq API 키를 다시 입력하세요!
+OPENAI_API_KEY = "apikey" # ⚠️ 여기에 실제 Groq API 키 확인!
 LLAMA_BASE_URL = "https://api.groq.com/openai/v1" 
 
 TOTAL_TRIALS_PER_CONDITION = 10 
@@ -40,7 +40,7 @@ SAVE_FILENAME = os.path.join(RESULT_DIR, "experiment_log_detailed.json")
 SUMMARY_FILENAME = os.path.join(RESULT_DIR, "experiment_summary_matrix.csv")
 RAW_CSV_FILENAME = os.path.join(RESULT_DIR, "experiment_raw_data_per_trial.csv")
 
-# 💡 [새로 추가된 진짜 로우데이터 저장 파일]
+# 💡 실시간 30fps 진짜 로우데이터 저장 파일
 TRUE_RAW_CSV_FILENAME = os.path.join(RESULT_DIR, "experiment_time_series_raw.csv")
 
 CONDITIONS = {
@@ -66,25 +66,30 @@ def speak(text):
     threading.Thread(target=_speak, daemon=True).start()
 
 def speech_recognition_thread():
-    global voice_command
+    global voice_command, running
     recognizer = sr.Recognizer()
-    recognizer.energy_threshold = 300       
+    
+    # 💡 [쌩상태 세팅] 노이즈 필터링 끄고, 아주 작은 소리(150)도 즉각 잡아내게 설정
+    recognizer.energy_threshold = 150       
     recognizer.dynamic_energy_threshold = False 
     recognizer.pause_threshold = 0.5        
     
     microphone = sr.Microphone()
-    print("[STT] 마이크 상시 대기 모드 켜짐 (노이즈 필터링 없이 즉각 반응)")
+    print("[STT] 마이크 상시 대기 모드 켜짐 (쌩상태 즉각 반응)")
     
     with microphone as source:
         while running:
             try:
+                # 💡 주변 소음 적응(adjust_for_ambient_noise) 완전 삭제! 딜레이 없이 즉시 듣기
                 audio = recognizer.listen(source, timeout=1.0, phrase_time_limit=3.0)
                 text = recognizer.recognize_google(audio, language="ko-KR")
-                print(f"🗣️ [음성 인식]: '{text}'")
+                print(f"🗣️ [음성 인식됨]: '{text}'")
                 with voice_lock:
                     voice_command = text
-            except sr.WaitTimeoutError: continue
-            except Exception: continue
+            except sr.WaitTimeoutError:
+                continue
+            except Exception:
+                continue
 
 def calculate_angle(a, b, c):
     ba = [a[0] - b[0], a[1] - b[1]]
@@ -140,6 +145,7 @@ def main():
     except: choice = 1
     CURRENT_CONDITION = CONDITIONS.get(choice, CONDITIONS[1])
 
+    # 💡 STT 스레드 및 로봇 리스너 시작
     stt_thread = threading.Thread(target=speech_recognition_thread, daemon=True)
     stt_thread.start()
     start_real_robot_gripper_listener(gripper_open_event)
@@ -182,11 +188,12 @@ def main():
     is_approved_rule = False
     key = -1 
 
-    # 💡 [핵심] 초당 30번씩 찍힐 진짜 로우데이터 파일 열기 준비
+    # 💡 [핵심] 초당 30번씩 찍힐 진짜 로우데이터 파일 열기 준비 (+ 12개 3D 관절 좌표 추가)
     true_raw_exists = os.path.isfile(TRUE_RAW_CSV_FILENAME)
     f_raw = open(TRUE_RAW_CSV_FILENAME, "a", encoding="utf-8-sig")
     if not true_raw_exists:
-        f_raw.write("Timestamp,Condition,Trial_Num,State,Shoulder_Angle,Elbow_Angle,Current_RULA,Robot_Target_Z_mm\n")
+        f_raw.write("Timestamp,Condition,Trial_Num,State,Shoulder_Angle,Elbow_Angle,Current_RULA,Robot_Target_Z_mm,"
+                    "Shoulder_X,Shoulder_Y,Shoulder_Z,Elbow_X,Elbow_Y,Elbow_Z,Wrist_X,Wrist_Y,Wrist_Z,Hip_X,Hip_Y,Hip_Z\n")
 
     while cap.isOpened() and trial_count < TOTAL_TRIALS_PER_CONDITION:
         ret, frame = cap.read()
@@ -198,18 +205,34 @@ def main():
         
         shoulder_ang, elbow_ang, current_rula = 0.0, 0.0, 1
         
+        # 💡 매 프레임 기록할 관절 변수 초기화 (안 보일 땐 0.0)
+        sh_x = sh_y = sh_z = 0.0
+        elb_x = elb_y = elb_z = 0.0
+        wr_x = wr_y = wr_z = 0.0
+        hip_x = hip_y = hip_z = 0.0
+
         if results.pose_landmarks:
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
             lm = results.pose_landmarks.landmark
-            shoulder, elbow, wrist, hip = [lm[12].x, lm[12].y], [lm[14].x, lm[14].y], [lm[16].x, lm[16].y], [lm[24].x, lm[24].y]
-            shoulder_ang = calculate_angle(hip, shoulder, elbow)
-            elbow_ang = calculate_angle(shoulder, elbow, wrist)
+            
+            # Mediapipe가 인식한 3D 좌표(X, Y, Z) 저장
+            sh_x, sh_y, sh_z = lm[12].x, lm[12].y, lm[12].z
+            elb_x, elb_y, elb_z = lm[14].x, lm[14].y, lm[14].z
+            wr_x, wr_y, wr_z = lm[16].x, lm[16].y, lm[16].z
+            hip_x, hip_y, hip_z = lm[24].x, lm[24].y, lm[24].z
+
+            shoulder_pt, elbow_pt, wrist_pt, hip_pt = [lm[12].x, lm[12].y], [lm[14].x, lm[14].y], [lm[16].x, lm[16].y], [lm[24].x, lm[24].y]
+            shoulder_ang = calculate_angle(hip_pt, shoulder_pt, elbow_pt)
+            elbow_ang = calculate_angle(shoulder_pt, elbow_pt, wrist_pt)
             current_rula = estimate_rula_score(shoulder_ang, elbow_ang)
             if current_rula >= 4: metrics["risky_posture_time_sec"] += 0.1
 
-        # 💡 [핵심] 매 프레임마다 시간, 각도, 현재 상태를 CSV에 밀어넣음 (이게 교수님이 원하시는 진짜 데이터!)
+        # 💡 매 프레임마다 시간, 상태, 각도 + 관절 3D 좌표(12개) 전부 기록!
         current_time_ms = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-        f_raw.write(f"{current_time_ms},{CURRENT_CONDITION['name']},{trial_count},{current_state},{shoulder_ang:.2f},{elbow_ang:.2f},{current_rula},{current_tighten_z_mm:.1f}\n")
+        f_raw.write(f"{current_time_ms},{CURRENT_CONDITION['name']},{trial_count},{current_state},"
+                    f"{shoulder_ang:.2f},{elbow_ang:.2f},{current_rula},{current_tighten_z_mm:.1f},"
+                    f"{sh_x:.4f},{sh_y:.4f},{sh_z:.4f},{elb_x:.4f},{elb_y:.4f},{elb_z:.4f},"
+                    f"{wr_x:.4f},{wr_y:.4f},{wr_z:.4f},{hip_x:.4f},{hip_y:.4f},{hip_z:.4f}\n")
 
         if current_state == "INIT_START":
             speak(f"[{CURRENT_CONDITION['name']}] 어깨 각도 180도 기준 초기 조립 위치로 이동합니다.")
@@ -224,7 +247,7 @@ def main():
             time.sleep(3.0)
             
             with voice_lock: voice_command = None 
-            speak("블록의 다섯 개 구멍에 볼트를 체결해 주세요.")
+            speak("블록의 네 개 구멍에 볼트를 체결해 주세요.")
             current_state = "BOLT_TIGHTENING"
             cycle_start_time = time.time()
             accumulated_shoulder_angles.clear(); accumulated_elbow_angles.clear(); accumulated_rula_scores.clear()
@@ -275,7 +298,7 @@ def main():
             is_approved_rule = False
 
             if control_type == "None":
-                speak("비개입 조건이므로 기존 높호를 그대로 유지합니다.")
+                speak("비개입 조건이므로 기존 높이를 그대로 유지합니다.")
                 is_approved_rule = False
                 current_state = "APPLY_NEXT_TARGET"
             else:
@@ -299,22 +322,25 @@ def main():
             elapsed_wait = time.time() - wait_start_time
             cv2.putText(frame, f"Waiting Answer... {5.0 - elapsed_wait:.1f}s", (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
             
+            # 💡 [핵심] 여기서 다시 마이크를 켜지 않고 백그라운드 STT가 들은 것만 가져옵니다! (마이크 충돌 방지)
+            local_voice = None
             with voice_lock:
                 if voice_command:
-                    user_response_text = voice_command
+                    local_voice = voice_command
                     voice_command = None
             
             manual_yes = (key == ord('y') or key == ord('Y'))
             manual_no = (key == ord('n') or key == ord('N'))
             
-            if user_response_text or elapsed_wait > 5.0 or manual_yes or manual_no:
+            if local_voice or elapsed_wait > 5.0 or manual_yes or manual_no:
                 if manual_yes:
                     user_response_text = "Yes, please adjust (Manual)"
                     print("[수동 조작 감지]: Y 키 (조정 승인)")
                 elif manual_no:
                     user_response_text = "No, keep it (Manual)"
                     print("[수동 조작 감지]: N 키 (조정 거절)")
-                elif user_response_text: 
+                elif local_voice: 
+                    user_response_text = local_voice
                     print(f"[작업자 답변]: '{user_response_text}'")
                 else: 
                     print("[대답 없음] 기본값으로 진행합니다.")
@@ -407,7 +433,7 @@ def main():
         key = cv2.waitKey(10) & 0xFF
         if key == 27: break
 
-    # 💡 루프가 끝나면 찐 로우데이터 파일도 안전하게 닫아줍니다.
+    # 💡 찐 로우데이터 파일도 안전하게 닫아줍니다.
     f_raw.close()
     
     running = False
@@ -432,7 +458,7 @@ def main():
                 f"{metrics['robot_adjustment_count']},{avg_adj_mm:.1f},{metrics['correction_commands_count']},"
                 f"{metrics['invalid_cmds']},{avg_llm_latency:.2f}\n")
     
-    speak("수고하셨습니다. 실험이 완료되었습니다.")
+    speak("수고하셨습니다. 실험이 종료되었습니다.")
 
 if __name__ == "__main__":
     main()
