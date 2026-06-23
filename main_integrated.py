@@ -25,7 +25,7 @@ from real_robot_gripper_source import start_real_robot_gripper_listener
 # =========================================================
 # API 및 환경 설정
 # =========================================================
-OPENAI_API_KEY = "apikey" # ⚠️ 실제 Groq API 키
+OPENAI_API_KEY = "api-key" # ⚠️ 실제 Groq API 키
 LLAMA_BASE_URL = "https://api.groq.com/openai/v1" 
 
 TOTAL_TRIALS_PER_CONDITION = 10 
@@ -39,7 +39,7 @@ SAVE_FILENAME = os.path.join(RESULT_DIR, "experiment_log_detailed.json")
 SUMMARY_FILENAME = os.path.join(RESULT_DIR, "experiment_summary_matrix.csv")
 RAW_CSV_FILENAME = os.path.join(RESULT_DIR, "experiment_raw_data_per_trial.csv")
 
-# 💡 [해결] 엑셀 헤더 충돌 방지를 위해 아예 새로운 이름의 파일로 생성 (20열 완벽 보장)
+# 💡 엑셀 헤더 충돌 방지를 위해 아예 새로운 이름의 파일로 생성 (20열 완벽 보장)
 TRUE_RAW_CSV_FILENAME = os.path.join(RESULT_DIR, "experiment_time_series_raw_3D_final.csv")
 
 CONDITIONS = {
@@ -210,7 +210,7 @@ def main():
             mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
             lm = results.pose_landmarks.landmark
             
-            # 💡 [확인] 4개 주요 관절의 3D(X,Y,Z) 좌표 12개 완벽 추출
+            # 💡 4개 주요 관절의 3D(X,Y,Z) 좌표 12개 완벽 추출
             sh_x, sh_y, sh_z = lm[12].x, lm[12].y, lm[12].z       # 어깨
             elb_x, elb_y, elb_z = lm[14].x, lm[14].y, lm[14].z    # 팔꿈치
             wr_x, wr_y, wr_z = lm[16].x, lm[16].y, lm[16].z       # 손목
@@ -220,9 +220,12 @@ def main():
             shoulder_ang = calculate_angle(hip_pt, shoulder_pt, elbow_pt)
             elbow_ang = calculate_angle(shoulder_pt, elbow_pt, wrist_pt)
             current_rula = estimate_rula_score(shoulder_ang, elbow_ang)
-            if current_rula >= 4: metrics["risky_posture_time_sec"] += 0.1
+            
+            # 💡 [수정 완료] RULA 점수 대신 '어깨 각도가 130도 이상'일 때 위험 시간(Risky Time)을 누적!
+            if shoulder_ang >= 130.0: 
+                metrics["risky_posture_time_sec"] += 0.1
 
-        # 💡 [확인] 매 프레임 시간, 상태, 각도 + 관절 3D 좌표 12개 실시간 기록 (총 20개 컬럼 일치)
+        # 💡 매 프레임 시간, 상태, 각도 + 관절 3D 좌표 12개 실시간 기록 (총 20개 컬럼 일치)
         current_time_ms = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         f_raw.write(f"{current_time_ms},{CURRENT_CONDITION['name']},{trial_count},{current_state},"
                     f"{shoulder_ang:.2f},{elbow_ang:.2f},{current_rula},{current_tighten_z_mm:.1f},"
@@ -289,7 +292,7 @@ def main():
             lead_type = CURRENT_CONDITION["lead"]
             control_type = CURRENT_CONDITION["control"]
             
-            # 💡 [롤백 완료] 작업 중 130도를 넘는 최대치 감지를 제거하고, 기존처럼 '평균 어깨 각도'로만 판단합니다.
+            # 💡 [기준 유지] 작업 중 평균 각도가 130도 이상일 때만 개입 판단
             is_risky = (cycle_avg_sh >= 130.0)
             
             user_response_text = ""
