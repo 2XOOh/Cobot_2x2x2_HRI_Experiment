@@ -548,11 +548,11 @@ def main():
         if results.pose_landmarks:
             lm = results.pose_landmarks.landmark
             
-            # 💡 2. 오른팔 인식을 위해 11, 13, 15, 23 사용
-            sh_x, sh_y, sh_z = lm[11].x, lm[11].y, lm[11].z       
-            elb_x, elb_y, elb_z = lm[13].x, lm[13].y, lm[13].z    
-            wr_x, wr_y, wr_z = lm[15].x, lm[15].y, lm[15].z       
-            hip_x, hip_y, hip_z = lm[23].x, lm[23].y, lm[23].z    
+            # 💡 2. 오른팔 인식을 위해 12, 14, 16, 24 사용
+            sh_x, sh_y, sh_z = lm[12].x, lm[12].y, lm[12].z       
+            elb_x, elb_y, elb_z = lm[14].x, lm[14].y, lm[14].z    
+            wr_x, wr_y, wr_z = lm[16].x, lm[16].y, lm[16].z       
+            hip_x, hip_y, hip_z = lm[24].x, lm[24].y, lm[24].z    
 
             h, w, _ = frame.shape
             shoulder_pt = [int(sh_x * w), int(sh_y * h)]
