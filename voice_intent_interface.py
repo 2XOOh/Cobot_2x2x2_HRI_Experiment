@@ -4,28 +4,29 @@ from __future__ import annotations
 import json
 import queue
 import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 
 DEFAULT_SYSTEM_PROMPT_PATH = Path(__file__).with_name("prompts") / "worker_intent_system.md"
+TASK_COMPLETION_KEYWORDS = ("끝", "완료", "다했", "다 했", "체결", "조립", "마무리", "오케이")
+APPROVE_KEYWORDS = ("응", "어", "네", "예", "그래", "좋아", "오케이", "ok", "맞아", "해줘", "조정")
+REJECT_KEYWORDS = ("아니", "아니요", "괜찮", "그대로", "하지마", "필요없", "됐어", "no", "노")
 
 
 @dataclass
-class IntentResult:
-    # 음성/텍스트 발화 해석 결과를 main에서 쓰기 쉬운 공통 형태로 담는다.
+class LlmAdjustmentDecision:
+    # LLM이 사용자 의도와 상태를 보고 조정 여부와 목표 어깨각을 판단한 결과를 담는다.
     action: str = "unknown"
-    direction: str = "none"
-    amount: str = "none"
+    target_shoulder_angle_deg: float | None = None
     confidence: float = 0.0
-    normalized_intent: str = ""
-    is_invalid: bool = False
-    is_emergency_stop: bool = False
-    clarification_question: str = ""
     reason: str = ""
     raw_text: str = ""
-    source: str = "rule"
+    source: str = "llm"
+    is_invalid: bool = False
+    clarification_question: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         # CSV 기록이나 디버깅용으로 dataclass를 dict로 변환한다.
@@ -162,128 +163,138 @@ class ContinuousSpeechRecognizer:
                     continue
 
 
-class RuleIntentParser:
-    # 명확한 키워드는 LLM 없이 빠르게 의도(action/direction/amount)로 분류한다.
-    EARLY_STOP_KEYWORDS = (
-        "그만",
-        "중단",
-        "포기",
-        "아파",
-        "위험",
-        "멈춰",
-        "스톱",
-        "stop",
-        "못하겠",
-        "힘들",
-        "실험종료",
+def is_task_completion_input(key: int, voice_text: str | None) -> bool:
+    # SPACE 키나 단순 완료 키워드가 들어왔는지 바로 판별한다.
+    if key == ord(" "):
+        return True
+    return _has_any(_normalize(voice_text or ""), TASK_COMPLETION_KEYWORDS)
+
+
+def parse_worker_adjustment_input(
+    wait_start_time: float,
+    key: int,
+    voice_text: str | None,
+    control_type: str,
+    rule_parser: "RuleIntentParser",
+    llm_parser: "LlmIntentParser | None" = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    # Worker 주도 조건에서 Y/N 키, rule 응답, LLM 응답을 한 곳에서 해석한다.
+    elapsed_wait = time.time() - wait_start_time
+    response = {
+        "answered": False,
+        "text": "",
+        "action": "unknown",
+        "elapsed_wait": elapsed_wait,
+        "target_shoulder_angle_deg": None,
+        "latency": 0.0,
+        "is_invalid": False,
+        "reason": "",
+        "source": "none",
+        "clarification_question": "",
+    }
+
+    manual_action = _manual_adjustment_action(key)
+    if manual_action:
+        response.update(
+            {
+                "answered": True,
+                "text": f"[Manual] {manual_action} adjustment",
+                "action": manual_action,
+                "source": "manual",
+                "reason": "matched manual key",
+            }
+        )
+        return response
+
+    if not voice_text:
+        return response
+
+    response["text"] = voice_text
+    if control_type == "LLM" and llm_parser is not None:
+        llm_start_time = time.time()
+        llm_decision = llm_parser.parse(
+            voice_text,
+            context="adjustment_response",
+            metadata=metadata,
+        )
+        response.update(
+            {
+                "action": llm_decision.action,
+                "target_shoulder_angle_deg": llm_decision.target_shoulder_angle_deg,
+                "latency": time.time() - llm_start_time,
+                "is_invalid": llm_decision.is_invalid,
+                "reason": llm_decision.reason,
+                "source": llm_decision.source,
+                "clarification_question": llm_decision.clarification_question,
+            }
+        )
+        response["answered"] = llm_decision.action in ("approve", "reject", "adjust")
+        return response
+
+    action = rule_parser.parse(voice_text, context="adjustment_response")
+    response.update(
+        {
+            "answered": action in ("approve", "reject"),
+            "action": action,
+            "source": "rule",
+            "reason": "matched rule keyword" if action != "unknown" else "no rule matched",
+            "is_invalid": action == "unknown",
+        }
     )
-    COMPLETE_KEYWORDS = ("끝", "완료", "다했", "다 했", "체결", "조립", "마무리", "오케이")
-    APPROVE_KEYWORDS = ("응", "어", "네", "예", "그래", "좋아", "오케이", "ok", "맞아", "해줘", "조정")
-    REJECT_KEYWORDS = ("아니", "아니요", "괜찮", "그대로", "하지마", "필요없", "됐어", "no", "노")
-    UP_KEYWORDS = ("올려", "높여", "위로", "상향")
-    DOWN_KEYWORDS = ("내려", "낮춰", "아래", "하향")
-    SMALL_KEYWORDS = ("조금", "살짝", "약간")
-    LARGE_KEYWORDS = ("많이", "크게", "확")
+    return response
 
-    def parse(self, text: str | None, context: str = "any") -> IntentResult:
-        # 한 문장을 rule 기반으로 early_stop/complete/approve/reject/adjust 중 하나로 해석한다.
-        raw_text = text or ""
-        normalized = self._normalize(raw_text)
+
+def _manual_adjustment_action(key: int) -> str | None:
+    # Worker 응답 대기 중 Y/N 키를 approve/reject로 바꾼다.
+    if key in (ord("y"), ord("Y")):
+        return "approve"
+    if key in (ord("n"), ord("N")):
+        return "reject"
+    return None
+
+
+def _normalize(text: str) -> str:
+    # 키워드 매칭을 위해 소문자화하고 공백을 제거한다.
+    return text.lower().replace(" ", "")
+
+
+def _has_any(normalized: str, keywords: tuple[str, ...]) -> bool:
+    # 정규화된 문장에 키워드 중 하나라도 포함되는지 확인한다.
+    return any(keyword.lower().replace(" ", "") in normalized for keyword in keywords)
+
+
+class RuleIntentParser:
+    # 명확한 키워드만 LLM 없이 빠르게 완료/승인/거절로 분류한다.
+    def parse(self, text: str | None, context: str = "any") -> str:
+        # 한 문장을 rule 기반으로 complete/approve/reject/unknown 중 하나로 해석한다.
+        normalized = _normalize(text or "")
         if not normalized:
-            return IntentResult(raw_text=raw_text, is_invalid=True, reason="empty input")
+            return "unknown"
 
-        if self._has_any(normalized, self.EARLY_STOP_KEYWORDS):
-            return IntentResult(
-                action="early_stop",
-                confidence=0.95,
-                normalized_intent="작업 또는 실험 중단 요청",
-                is_emergency_stop=True,
-                raw_text=raw_text,
-                reason="matched early stop keyword",
-            )
+        if context == "task_completion" and _has_any(normalized, TASK_COMPLETION_KEYWORDS):
+            return "complete"
 
-        if context == "task_completion" and self._has_any(normalized, self.COMPLETE_KEYWORDS):
-            return IntentResult(
-                action="complete",
-                confidence=0.85,
-                normalized_intent="현재 작업 완료",
-                raw_text=raw_text,
-                reason="matched completion keyword",
-            )
+        if context == "adjustment_response" and _has_any(normalized, REJECT_KEYWORDS):
+            return "reject"
 
-        direction = self._detect_direction(normalized)
-        if direction != "none":
-            return IntentResult(
-                action="adjust",
-                direction=direction,
-                amount=self._detect_amount(normalized),
-                confidence=0.85,
-                normalized_intent="높이 조정 요청",
-                raw_text=raw_text,
-                reason="matched adjustment keyword",
-            )
+        if context == "adjustment_response" and _has_any(normalized, APPROVE_KEYWORDS):
+            return "approve"
 
-        if self._has_any(normalized, self.REJECT_KEYWORDS):
-            return IntentResult(
-                action="reject",
-                direction="keep",
-                confidence=0.85,
-                normalized_intent="조정 거절 또는 현재 높이 유지",
-                raw_text=raw_text,
-                reason="matched rejection keyword",
-            )
+        if context == "any" and _has_any(normalized, TASK_COMPLETION_KEYWORDS):
+            return "complete"
 
-        if self._has_any(normalized, self.APPROVE_KEYWORDS):
-            return IntentResult(
-                action="approve",
-                confidence=0.75,
-                normalized_intent="조정 승인",
-                raw_text=raw_text,
-                reason="matched approval keyword",
-            )
+        if context == "any" and _has_any(normalized, REJECT_KEYWORDS):
+            return "reject"
 
-        if context == "any" and self._has_any(normalized, self.COMPLETE_KEYWORDS):
-            return IntentResult(
-                action="complete",
-                confidence=0.85,
-                normalized_intent="현재 작업 완료",
-                raw_text=raw_text,
-                reason="matched completion keyword",
-            )
+        if context == "any" and _has_any(normalized, APPROVE_KEYWORDS):
+            return "approve"
 
-        return IntentResult(raw_text=raw_text, is_invalid=True, reason="no rule matched")
-
-    def _detect_direction(self, normalized: str) -> str:
-        # 높이 조정 방향을 up/down/none으로 감지한다.
-        has_up = self._has_any(normalized, self.UP_KEYWORDS)
-        has_down = self._has_any(normalized, self.DOWN_KEYWORDS)
-        if has_up and not has_down:
-            return "up"
-        if has_down and not has_up:
-            return "down"
-        return "none"
-
-    def _detect_amount(self, normalized: str) -> str:
-        # 조정 크기를 small/medium/large로 감지한다.
-        if self._has_any(normalized, self.LARGE_KEYWORDS):
-            return "large"
-        if self._has_any(normalized, self.SMALL_KEYWORDS):
-            return "small"
-        return "medium"
-
-    @staticmethod
-    def _normalize(text: str) -> str:
-        # 키워드 매칭을 위해 소문자화하고 공백을 제거한다.
-        return text.lower().replace(" ", "")
-
-    @staticmethod
-    def _has_any(normalized: str, keywords: tuple[str, ...]) -> bool:
-        # 정규화된 문장에 키워드 중 하나라도 포함되는지 확인한다.
-        return any(keyword.lower().replace(" ", "") in normalized for keyword in keywords)
+        return "unknown"
 
 
 class LlmIntentParser:
-    # rule로 애매한 발화를 LLM에 보내 의도만 구조화해서 받는다.
+    # LLM으로 작업자 의도와 상태를 해석해 조정 여부와 목표 어깨각을 구조화해서 받는다.
     def __init__(
         self,
         api_key: str,
@@ -304,8 +315,8 @@ class LlmIntentParser:
         text: str | None,
         context: str = "any",
         metadata: dict[str, Any] | None = None,
-    ) -> IntentResult:
-        # 발화와 context를 LLM에 보내고 IntentResult로 변환한다.
+    ) -> LlmAdjustmentDecision:
+        # 발화와 context를 LLM에 보내고 LlmAdjustmentDecision으로 변환한다.
         raw_text = text or ""
         system_prompt = self.system_prompt_path.read_text(encoding="utf-8")
         user_content = self._build_user_content(raw_text, context, metadata)
@@ -324,9 +335,8 @@ class LlmIntentParser:
             parsed = json.loads(content.strip())
             return self._result_from_json(parsed, raw_text)
         except Exception as exc:
-            return IntentResult(
+            return LlmAdjustmentDecision(
                 raw_text=raw_text,
-                source="llm",
                 is_invalid=True,
                 reason=f"LLM intent parsing failed: {exc}",
             )
@@ -346,18 +356,28 @@ class LlmIntentParser:
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     @staticmethod
-    def _result_from_json(parsed: dict[str, Any], raw_text: str) -> IntentResult:
-        # LLM이 반환한 JSON dict를 IntentResult로 변환한다.
-        return IntentResult(
+    def _result_from_json(parsed: dict[str, Any], raw_text: str) -> LlmAdjustmentDecision:
+        # LLM이 반환한 JSON dict에서 action과 목표 어깨각만 main에서 쓰기 쉽게 꺼낸다.
+        return LlmAdjustmentDecision(
             action=str(parsed.get("action", "unknown")),
-            direction=str(parsed.get("direction", "none")),
-            amount=str(parsed.get("amount", "none")),
+            target_shoulder_angle_deg=LlmIntentParser._optional_float(
+                parsed.get("target_shoulder_angle_deg")
+                or parsed.get("target_angle_deg")
+                or parsed.get("shoulder_angle_deg")
+            ),
             confidence=float(parsed.get("confidence", 0.0) or 0.0),
-            normalized_intent=str(parsed.get("normalized_intent", "")),
             is_invalid=bool(parsed.get("is_invalid", False)),
-            is_emergency_stop=bool(parsed.get("is_emergency_stop", False)),
             clarification_question=str(parsed.get("clarification_question", "")),
             reason=str(parsed.get("reason", "")),
             raw_text=raw_text,
-            source="llm",
         )
+
+    @staticmethod
+    def _optional_float(value: Any) -> float | None:
+        # LLM이 숫자를 문자열로 줘도 목표 어깨각으로 쓸 수 있게 float로 변환한다.
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
