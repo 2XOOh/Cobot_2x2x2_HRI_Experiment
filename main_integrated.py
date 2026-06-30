@@ -549,7 +549,21 @@ def main():
             SetReviewPending(True)
             user_response_text = ""
             policy = decide_returning_policy(current_condition, cycle_is_risky)
-            speak(policy["message"])
+            
+            # 💡 [핵심] 위험 자세 감지 여부와 주도권(Lead)에 따른 안내 멘트 분기 처리
+            if cycle_is_risky:
+                if current_condition.get("lead") == "System":
+                    # 🤖 시스템 주도 조건일 때
+                    message_to_speak = "위험 자세가 감지되어 조정하겠습니다."
+                else:
+                    # 🧑‍🔧 작업자 주도 조건일 때 (HRI / User 등)
+                    message_to_speak = "위험 자세가 감지되었습니다. 조정해 드릴까요?"
+            else:
+                # 위험 자세가 아닐 때는 원래 정의된 기본 메세지 사용 (예: "높이를 유지합니다")
+                message_to_speak = policy["message"]
+            
+            # 최종 결정된 대사 음성 출력
+            speak(message_to_speak)
 
             if policy["mode"] == "auto":
                 if policy["is_risky"] and current_condition["lead"] == "System":
