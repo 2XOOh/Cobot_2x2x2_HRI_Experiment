@@ -130,6 +130,10 @@ def _normalize(text: str) -> str:
 def _has_any(normalized: str, keywords: tuple[str, ...]) -> bool:
     return any(keyword.lower().replace(" ", "") in normalized for keyword in keywords)
 
+# 💡 메인 코드에서 "완료"라고 말했는지 확인할 때 쓰는 함수 (이 부분 추가!)
+def is_task_completion_input(text: str | None) -> bool:
+    normalized = _normalize(text or "")
+    return _has_any(normalized, TASK_COMPLETION_KEYWORDS)
 
 class RuleIntentParser:
     # Worker + Rule 조건용 심플 파서 (방향/크기 분석 없이 명확한 승인/거절만 판단)
