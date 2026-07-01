@@ -18,7 +18,6 @@ from voice_intent_interface import (
     QueuedTtsSpeaker,
     RuleIntentParser,
     is_task_completion_input,
-    parse_worker_adjustment_input,
 )
 
 # =========================================================
@@ -613,47 +612,87 @@ def main():
         # Sequence 6) Worker 주도 조건에서만: RETURNING 중 작업자 답변을 기다렸다가
         # LLM 또는 Rule 계산에 반영해 다음 target_z를 만든다.
         if robot_state == "RETURNING" and awaiting_worker_answer:
-            worker_response = parse_worker_adjustment_input(
-                wait_start_time=wait_start_time,
-                key=key,
-                voice_text=current_voice,
-                control_type=current_condition["control"],
-                rule_parser=rule_intent_parser,
-                llm_parser=llm_intent_parser,
-                metadata={
-                    "condition": current_condition,
-                    "cycle_task_time_sec": cycle_task_time_sec,
-                    "cycle_risky_time_sec": cycle_risky_time_sec,
-                    "cycle_is_risky": cycle_is_risky,
-                    "cycle_avg_shoulder_angle_deg": cycle_avg_shoulder_angle_deg,
-                    "current_work_z_mm": current_tighten_z_mm,
-                    "rule_shoulder_reduction_deg": RULE_SHOULDER_REDUCTION_DEG,
-                    "user_shoulder_height_mm": user_shoulder_height_cm * 10,
-                    "upper_arm_mm": l1_cm * 10,
-                    "forearm_mm": l2_cm * 10,
-                },
-            )
-            elapsed_wait = worker_response["elapsed_wait"]
+            elapsed_wait = time.time() - wait_start_time
             cv2.putText(frame, f"Waiting Answer... {elapsed_wait:.1f}s", (20, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
 
-            if current_voice or worker_response["source"] == "manual":
-                print(f"[작업자 답변]: '{worker_response['text']}' -> {worker_response['action']} ({worker_response['source']})")
+            # 1. 수동 키보드 오버라이드 처리 ('y' 승인, 'n' 거절)
+            manual_action = None
+            if key in (ord('y'), ord('Y')):
+                manual_action = "approve"
+            elif key in (ord('n'), ord('N')):
+                manual_action = "reject"
 
-            if worker_response["action"] == "ask_clarification" and worker_response["clarification_question"]:
-                speak(worker_response["clarification_question"])
-                speech_recognizer.get_and_clear()
+            voice_text = current_voice
+            action = "unknown"
+            target_ang = None
+            is_invalid = False
+            llm_latency = 0.0
 
-            if worker_response["answered"]:
-                should_adjust = worker_response["action"] in ("approve", "adjust")
+            # 2. 판단 시작
+            if manual_action:
+                action = manual_action
+                voice_text = "[Manual Key Override]"
+            elif voice_text:
+                print(f"🎙️ [작업자 발화 인식됨]: '{voice_text}'")
+                start_time = time.time()
+
+                if current_condition.get("control") == "LLM":
+                    # 🚀 [Worker+LLM] 우리가 만든 새 LLM 파서 직접 호출!
+                    decision = llm_parser.parse(
+                        text=voice_text,
+                        context="adjustment_response",
+                        metadata={
+                            "condition": current_condition,
+                            "cycle_task_time_sec": cycle_task_time_sec,
+                            "cycle_risky_time_sec": cycle_risky_time_sec,
+                            "cycle_is_risky": cycle_is_risky,
+                            "cycle_avg_shoulder_angle_deg": cycle_avg_shoulder_angle_deg,
+                            "current_work_z_mm": current_tighten_z_mm,
+                            "rule_shoulder_reduction_deg": RULE_SHOULDER_REDUCTION_DEG,
+                            "user_shoulder_height_mm": user_shoulder_height_cm * 10,
+                            "upper_arm_mm": l1_cm * 10,
+                            "forearm_mm": l2_cm * 10,
+                        }
+                    )
+                    action = decision.action
+                    target_ang = decision.target_shoulder_angle_deg
+                    is_invalid = decision.is_invalid
+
+                    # LLM이 되묻기를 요청한 경우 ("올릴까요, 낮출까요?")
+                    if action == "ask_clarification" and decision.clarification_question:
+                        speak(decision.clarification_question)
+                        speech_recognizer.get_and_clear()
+                        action = "waiting"  # 처리를 미루고 다시 기다림
+                else:
+                    # ⚙️ [Worker+Rule] 심플한 Rule 파서 호출
+                    action = rule_intent_parser.parse(text=voice_text, context="adjustment_response")
+                    
+                llm_latency = time.time() - start_time
+
+            # 3. 무한 대기 방지 타임아웃 (예: 10초 이상 무응답시 거절로 간주)
+            if not manual_action and not voice_text and elapsed_wait > 10.0:
+                print("⏱️ [타임아웃] 응답이 없어 현재 높이를 유지합니다.")
+                action = "reject"
+                voice_text = "[Timeout]"
+
+            # 4. 판단 결과 실행 (approve, adjust, reject 인 경우만)
+            if action in ("approve", "adjust", "reject"):
+                print(f"[의도 해석 완료] '{voice_text}' -> {action}")
+                should_adjust = action in ("approve", "adjust")
+                
                 apply_next_target(
-                    worker_response["text"],
+                    voice_text,
                     should_adjust,
-                    target_shoulder_angle_deg=worker_response["target_shoulder_angle_deg"],
-                    llm_latency=worker_response["latency"],
-                    is_invalid=worker_response["is_invalid"],
+                    target_shoulder_angle_deg=target_ang,
+                    llm_latency=llm_latency,
+                    is_invalid=is_invalid,
                 )
-            elif current_voice and worker_response["action"] != "ask_clarification":
-                print("[작업자 답변 해석 실패] 다시 답변을 기다립니다.")
+                awaiting_worker_answer = False  # 대기 상태 해제!
+                speech_recognizer.get_and_clear()
+                
+            elif action == "unknown":
+                print("[작업자 답변 해석 실패] 의미를 알 수 없습니다. 다시 답변을 기다립니다.")
+                speech_recognizer.get_and_clear()
 
         # Sequence 7) IDLE: 한 cycle이 완전히 끝난 뒤의 대기 구간.
         if entered_idle:
