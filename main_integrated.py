@@ -544,35 +544,71 @@ def main():
                 completion_sent = True
 
         # Sequence 5) RETURNING 진입: 작업이 끝나 로봇이 복귀하기 시작한 시점.
-        # 여기서 5개 컨디션 중 현재 조건에 맞춰 자동 유지/자동 보정/작업자 질문을 결정한다.
         if entered_returning and completion_sent:
             SetReviewPending(True)
             user_response_text = ""
             policy = decide_returning_policy(current_condition, cycle_is_risky)
             
-            # 💡 [핵심] 위험 자세 감지 여부와 주도권(Lead)에 따른 안내 멘트 분기 처리
+            # (1) 안내 멘트 출력 (System vs Worker)
             if cycle_is_risky:
                 if current_condition.get("lead") == "System":
-                    # 🤖 시스템 주도 조건일 때
                     message_to_speak = "위험 자세가 감지되어 조정하겠습니다."
                 else:
-                    # 🧑‍🔧 작업자 주도 조건일 때 (HRI / User 등)
                     message_to_speak = "위험 자세가 감지되었습니다. 조정해 드릴까요?"
             else:
-                # 위험 자세가 아닐 때는 원래 정의된 기본 메세지 사용 (예: "높이를 유지합니다")
                 message_to_speak = policy["message"]
-            
-            # 최종 결정된 대사 음성 출력
             speak(message_to_speak)
 
+            # (2) 현재 Cycle의 메타데이터 생성 (LLM에 넘겨줄 정보)
+            cycle_metadata = {
+                "condition": current_condition,
+                "cycle_is_risky": cycle_is_risky,
+                "cycle_avg_shoulder_angle_deg": avg_shoulder_ang,
+                "rule_shoulder_reduction_deg": 20.0,
+                # 필요하다면 task_time_sec 등도 여기에 추가
+            }
+
+            # =================================================================
+            # 💡 분기점: 시스템 주도(Auto) vs 작업자 주도(Worker)
+            # =================================================================
             if policy["mode"] == "auto":
-                if policy["is_risky"] and current_condition["lead"] == "System":
+                # [System-led]
+                if policy["is_risky"] and current_condition.get("lead") == "System":
                     metrics["system_intervention_count"] += 1
-                apply_next_target(user_response_text, policy["should_adjust"])
+                    
+                    # 🔥 System + LLM 조건일 때 LLM을 호출하여 목표각을 알아낸다!
+                    if current_condition.get("control") == "LLM":
+                        print("🤖 [System+LLM] 조정을 위한 LLM 판단 중...")
+                        sys_decision = llm_parser.parse(
+                            text="", # System 주도이므로 빈 텍스트
+                            context="system_adjustment",
+                            metadata=cycle_metadata
+                        )
+                        print(f"   => 결정: {sys_decision.action}, 각도: {sys_decision.target_shoulder_angle_deg}, 사유: {sys_decision.reason}")
+                        
+                        # LLM이 판단한 목표 어깨각을 적용
+                        if sys_decision.action == "adjust" and sys_decision.target_shoulder_angle_deg is not None:
+                            policy["should_adjust"] = True
+                            # (주의) apply_next_target 함수가 목표각(target_shoulder_angle_deg)을 받을 수 있도록 파라미터 수정이 필요할 수 있습니다.
+                            apply_next_target(sys_decision.reason, policy["should_adjust"], target_angle=sys_decision.target_shoulder_angle_deg)
+                        else:
+                            policy["should_adjust"] = False
+                            apply_next_target(sys_decision.reason, policy["should_adjust"])
+                    
+                    # System + Rule 인 경우 (기존 로직 수행)
+                    else:
+                        apply_next_target("System Rule Auto Adjust", policy["should_adjust"])
+                else:
+                    apply_next_target("", policy["should_adjust"])
+
             else:
+                # [Worker-led] (기존 로직과 동일하게 마이크를 열고 기다림)
                 speech_recognizer.get_and_clear()
                 wait_start_time = time.time()
                 awaiting_worker_answer = True
+                
+                # (참고) 이후 작업자가 말을 하면 awaiting_worker_answer 블록 안에서 
+                # llm_parser.parse(text=voice_text, context="adjustment_response", metadata=cycle_metadata) 가 호출되도록 작성하시면 됩니다!
 
         # Sequence 6) Worker 주도 조건에서만: RETURNING 중 작업자 답변을 기다렸다가
         # LLM 또는 Rule 계산에 반영해 다음 target_z를 만든다.
