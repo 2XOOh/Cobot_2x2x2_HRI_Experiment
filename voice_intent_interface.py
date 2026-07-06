@@ -59,28 +59,36 @@ class QueuedTtsSpeaker:
         # TTS worker thread에 종료 신호를 보낸다.
         self._queue.put(None)
 
+    def wait_until_done(self, timeout_sec: float | None = None) -> None:
+        deadline = None if timeout_sec is None else time.time() + timeout_sec
+        while self._queue.unfinished_tasks:
+            if deadline is not None and time.time() >= deadline:
+                return
+            time.sleep(0.05)
+
     def _worker(self) -> None:
         # pyttsx3 엔진을 유지하면서 큐에 들어온 문장을 읽는다.
-        engine = None
         while True:
             text = self._queue.get()
+            engine = None
             try:
                 if text is None:
                     return
-                if engine is None:
-                    import pyttsx3
 
-                    engine = pyttsx3.init()
+                import pyttsx3
+
+                engine = pyttsx3.init()
+                engine.setProperty("rate", 160)
                 engine.say(text)
                 engine.runAndWait()
-            except Exception:
+            except Exception as exc:
+                print(f"[TTS ERROR] {exc}")
+            finally:
                 try:
                     if engine is not None:
                         engine.stop()
                 except Exception:
                     pass
-                engine = None
-            finally:
                 self._queue.task_done()
 
 
@@ -188,6 +196,7 @@ def parse_worker_adjustment_input(
         "elapsed_wait": elapsed_wait,
         "target_shoulder_angle_deg": None,
         "latency": 0.0,
+        "confidence": 0.0,
         "is_invalid": False,
         "reason": "",
         "source": "none",
@@ -203,6 +212,7 @@ def parse_worker_adjustment_input(
                 "action": manual_action,
                 "source": "manual",
                 "reason": "matched manual key",
+                "confidence": 1.0,
             }
         )
         return response
@@ -223,6 +233,7 @@ def parse_worker_adjustment_input(
                 "action": llm_decision.action,
                 "target_shoulder_angle_deg": llm_decision.target_shoulder_angle_deg,
                 "latency": time.time() - llm_start_time,
+                "confidence": llm_decision.confidence,
                 "is_invalid": llm_decision.is_invalid,
                 "reason": llm_decision.reason,
                 "source": llm_decision.source,
@@ -239,6 +250,7 @@ def parse_worker_adjustment_input(
             "action": action,
             "source": "rule",
             "reason": "matched rule keyword" if action != "unknown" else "no rule matched",
+            "confidence": 1.0 if action != "unknown" else 0.0,
             "is_invalid": action == "unknown",
         }
     )
@@ -329,6 +341,7 @@ class LlmIntentParser:
                     {"role": "user", "content": user_content},
                 ],
                 temperature=self.temperature,
+                max_tokens=200,
                 response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content or "{}"

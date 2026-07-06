@@ -29,7 +29,7 @@ class PickAndPlaceExperiment:
         current_floor_z_m = round(current_pass_floor_z_mm / 1000.0, 3)
         recommended_floor_z_m = round(target_pass_floor_z_mm / 1000.0, 3)
 
-        # LLM 프롬프트 (130도 기준 상향, JSON 스키마 구조 최신화)
+        # LLM 프롬프트 (110도 기준 상향, JSON 스키마 구조 최신화)
         system_prompt = f"""
         당신은 인간-로봇 상호작용(HRI) 실험을 통제하는 인공지능 제어 뇌입니다.
         현재 작업자는 볼트 조립을 마치고 로봇이 대기 위치로 돌아간 상태에서 다음 조립 위치 조절 여부를 결정해야 합니다.
@@ -37,7 +37,7 @@ class PickAndPlaceExperiment:
         [시스템 제어 및 안전 사양 가이드라인]
         1. final_z_m은 반드시 바닥 기준 높이(m)입니다. link0 기준 좌표는 출력하지 마세요.
         2. 바닥 기준 Z 한계치: 최소 {MIN_FLOOR_Z_M:.3f}m ~ 최대 {MAX_FLOOR_Z_M:.3f}m.
-        3. 평균 어깨 각도가 130도 이상이면 작업 영역이 과도하게 높아서 팔이 무리하게 들린 상태이므로 낮춰주어야 인체공학적으로 안전합니다.
+        3. 평균 어깨 각도가 110도 이상이면 작업 영역이 과도하게 높아서 팔이 무리하게 들린 상태이므로 낮춰주어야 인체공학적으로 안전합니다.
         4. 인체공학 추천 높이는 안정 어깨각도 20도와 팔꿈치 0도(팔을 쭉 뻗은 상태)를 기준으로 계산된 값입니다.
         5. 추천 높이 공식: 어깨높이 - (상완길이 × cos(목표 어깨각도) + 하완길이 × cos(0도)).
         6. 작업자가 '조금' 올려/낮춰 달라고 요구할 경우 3~5cm(0.03~0.05m), '많이'라고 하면 10~15cm(0.10~0.15m) 내외로 계산하여 final_z_m을 결정하세요.
@@ -49,7 +49,7 @@ class PickAndPlaceExperiment:
         {{
            "decision_action": "유지, 상향, 하향, 비상정지, 재질문 중 택1",
            "normalized_intent": "작업자의 명확한 의도 요약",
-           "thought": "관절 각도(130도 기준) 분석 및 음성 의도 파악에 대한 판단 근거 요약",
+           "thought": "관절 각도(110도 기준) 분석 및 음성 의도 파악에 대한 판단 근거 요약",
            "is_approved": true 또는 false,
            "is_correction": true 또는 false,
            "is_invalid": true 또는 false,

@@ -56,7 +56,8 @@ def SendPassGoal(payload, timeout_sec=2.0, base_url=BASE_RECEIVER_URL):
             timeout_sec=timeout_sec,
             base_url=base_url,
         )
-        print(f"📡 [PASS_GOAL 전송 성공] {result}")
+        target_type = payload.get("target_type", "legacy_z") if isinstance(payload, dict) else "json"
+        print(f"📡 [PASS_GOAL 전송 성공] target_type={target_type} | {result}")
         return True
     except Exception as e:
         print(f"📡 [PASS_GOAL 전송 실패] {e}")
