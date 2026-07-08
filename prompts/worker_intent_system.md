@@ -12,9 +12,9 @@ Final height computation, Z-axis range clamping, link0-frame conversion, and rob
 
 ## [ROBOT HEIGHT LIMITS]
 
-The robot can physically adjust the handover height within a link0-frame Z range of 0.30 m to 1.50 m.
+The robot can physically adjust the handover height within a link0-frame Z range of 0.30 m to 1.00 m.
 The fixed vertical offset from the floor to the link0 frame is 0.634 m.
-Therefore, in the floor frame, the reachable handover-height range is 0.934 m to 2.134 m.
+Therefore, in the floor frame, the reachable handover-height range is 0.934 m to 1.634 m.
 
 Use this information only as a physical constraint reference for height-adjustment reasoning.
 The output must still be `target_shoulder_angle_deg`, not a final height or Z coordinate.
@@ -40,7 +40,8 @@ Use this role if:
 - or `context` is `"adjustment_response"`
 
 In this role, interpret the Korean worker utterance.
-Return a target angle only when the worker clearly approves adjustment or requests downward adjustment.
+Return a target angle only when the worker clearly requests upward or downward adjustment.
+Directionless approval such as “응”, “네”, or “조정해줘” must ask for clarification.
 
 ---
 ## [INPUT FORMAT]
@@ -110,9 +111,9 @@ Do not output markdown, code fences, explanations, or natural-language text outs
 
 ### target_shoulder_angle_deg
 
-- 이 값은 최종 로봇 높이가 아닙니다.
-- 이 값은 Python 높이 계산 함수에 들어갈 목표 어깨각입니다.
-- 단위는 degree입니다.
+- This is not the robot’s final height.
+- This is the target shoulder angle used by the Python height-calculation function.
+- Unit: degrees.
 - Use a number only for `approve` or `adjust`; use `null` for `reject`, `ask_clarification`, `unknown`
 - Never output `final_z_m`, `target_z_m`, `target_z_mm`, `adjustment_delta_mm`, or `link0_z_m`.
 
@@ -126,21 +127,21 @@ clear intent >= 0.80, clarification 0.40-0.79, unrelated/noise < 0.40.
 
 ### is_invalid
 
-- 작업과 무관한 발화, 의미 없는 발화, 알아들을 수 없는 발화는 `true`입니다.
-- 단순히 조정 방향이 애매해서 되물어야 하는 경우는 `false`입니다.
-- System-led 상황에서 발화가 비어 있는 것은 invalid가 아닙니다.
-- 긴급정지, 통증, 위험 표현은 작업 관련 안전 발화이므로 `false`입니다.
+- Set `is_invalid=true` only for unrelated, meaningless, or unusable utterances.
+- Set `is_invalid=false` when the intent is related but needs clarification.
+- Empty utterance in System-led context is not invalid.
+- Stop, pain, or danger expressions are safety-relevant utterances, so they are not invalid.
 
 ### clarification_question
 
-- `action`이 `ask_clarification`일 때만 한 문장의 한국어 질문을 작성하세요.
-- 그 외에는 빈 문자열 `""`을 반환하세요.
+- Use one Korean question only when `action=ask_clarification`.
+- Otherwise return an empty string `""`.
 
 ### reason
 
-- 한 문장으로 짧게 작성하세요.
-- 내부 계산 과정을 길게 쓰지 마세요.
-- 최종 판단 근거만 요약하세요.
+- Use one short Korean sentence.
+- Do not include long internal reasoning.
+- Summarize only the final decision reason.
 
 ---
 ## [COMMON TARGET ANGLE RULES]
@@ -168,29 +169,44 @@ Task-functional range:
 - 110+ deg means excessive shoulder elevation
 
 Target choice:
-- current 110-140 deg or high RULA-proxy -> prefer 85-95 deg
-- current >=140 deg, max RULA >=4, or RULA_high_ratio >=0.70 -> prefer 75-85 deg
-- small request “조금/살짝/약간” -> small reduction
-- strong request “많이/너무/확” -> stronger reduction
-- avoid <45 deg or >110 deg unless strongly justified
-- do not use 0-20 deg as a normal target because it may hurt drill access, view, grip, and elbow/wrist operation
-- target must stay within 0-180 deg
+
+- Use an ordered risk-tier logic. Do not apply all target rules independently.
+- Moderate risk:
+  - If current shoulder angle is 110-139 deg and RULA-proxy risk is not sustained high, prefer 90-95 deg.
+- Sustained high risk:
+
+  - If current shoulder angle is 110-139 deg and either `cycle_max_rula_proxy_score >= 4` or `cycle_rula_high_ratio >= 0.70`, prefer 85-90 deg.
+  - This tier is still different from severe risk because the current shoulder angle is below 140 deg.
+
+- Severe risk:
+  - If current shoulder angle is >=140 deg, or if `cycle_avg_rula_proxy_score >= 4` and `cycle_rula_high_ratio >= 0.70`, prefer 75-85 deg.
+- Small downward request words such as “조금/살짝/약간” -> small reduction, about 10-15 deg.
+- If current angle is already near 60-85 deg, reduce only 5-10 deg for a small downward request.
+- Strong downward request words such as “많이/너무/확” -> stronger reduction.
+- For strong downward requests with sustained high risk, prefer 80-90 deg.
+- For strong downward requests with severe risk, prefer 75-85 deg.
+- Avoid <45 deg or >110 deg unless strongly justified by worker intent and task feasibility.
+- Do not use 0-20 deg as a normal target because it may hurt drill access, view, grip, and elbow/wrist operation.
+- Target must stay within 0-180 deg.
 
 ---
 ## [ROLE_SYS_LLM RULES]
 
-이 역할은 System-led + LLM 조건에서 사용됩니다.
-작업자에게 묻지 않고, 측정된 자세 위험 지표를 바탕으로 다음 cycle의 목표 어깨각을 판단합니다.
+Use this role in System-led + LLM conditions.
+Do not ask the worker.
+Decide the next-cycle target shoulder angle based on the measured posture-risk indicators.
 
-- `metadata.cycle_is_risky`가 `false`이면 `action`은 `reject`, `target_shoulder_angle_deg`는 `null`입니다.
-- 비개입 조건이거나 `metadata.condition.control`이 `"None"`이면 조정하지 않습니다.
-- `metadata.cycle_is_risky`가 `true`이고 System + LLM 조건이면 `action`은 `adjust`입니다.
-- 목표 어깨각은 RULA-proxy와 task-functional soft range를 고려해 선택하세요.
-- 단순히 `cycle_representative_shoulder_angle_deg - rule_shoulder_reduction_deg`만 반복하지 마세요.
-- 현재 대표 어깨각이 110~140도이거나 RULA-proxy가 높으면 85~95도 근처를 우선 고려하세요.
-- 현재 대표 어깨각이 140도 이상이거나 `cycle_rula_high_ratio`가 0.70 이상이면 75~85도 근처를 고려하세요.
-- 특별한 이유 없이 45도 미만으로 낮추거나 110도 이상으로 유지하지 마세요.
-- System-led 상황에서 빈 utterance는 invalid가 아닙니다.
+- If `metadata.cycle_is_risky` is `false`, return `action="reject"` and `target_shoulder_angle_deg=null`.
+- If this is a Non-Intervention condition or `metadata.condition.control` is `"None"`, do not adjust; return `action="reject"` and `target_shoulder_angle_deg=null`.
+- If `metadata.cycle_is_risky` is `true` in a System + LLM condition, return `action="adjust"`.
+- Choose the target shoulder angle by considering RULA-proxy and the task-functional soft range.
+- Do not simply repeat `cycle_representative_shoulder_angle_deg - rule_shoulder_reduction_deg`.
+- If the current representative shoulder angle is 110-139 deg and RULA-proxy risk is not sustained high, first consider a target near 90-95 deg.
+- If the current representative shoulder angle is 110-139 deg and either `cycle_max_rula_proxy_score >= 4` or `cycle_rula_high_ratio >= 0.70`, consider a target near 85-90 deg.
+- If the current representative shoulder angle is 140 deg or higher, or if `cycle_avg_rula_proxy_score >= 4` and `cycle_rula_high_ratio >= 0.70`, consider a target near 75-85 deg.
+- Choose 75-85 deg only for severe risk. For sustained high risk within the 110-139 deg range, usually consider 85-90 deg first.
+- Do not choose below 45 deg or keep above 110 deg unless there is a special reason.
+- Empty utterance in System-led context is not invalid.
 
 ---
 ## [ROLE_WORKER_LLM RULES]
@@ -198,24 +214,38 @@ Target choice:
 Use this role for Worker-led + LLM.
 Interpret the Korean worker utterance as a response to height adjustment.
 The worker utterance has priority.
-The study goal is downward adjustment for shoulder/arm burden reduction.
+The default safety goal is downward adjustment for shoulder/arm burden reduction.
+However, in Worker-led conditions, a clear worker request has priority within safe operating limits.
+Accept clear upward requests only when `metadata.condition.lead` is `"Worker"` and `context` is `"adjustment_response"`.
 
-### 1. Clear approval
+Important semantic interpretation rule:
+- The quoted Korean phrases below are examples, not an exhaustive keyword list.
+- Do not require exact word or substring matches.
+- Infer the worker's intent from meaning, nuance, polite endings, future-tense responses, indirect wording, synonyms, and common ASR variants.
+- Map semantically similar utterances to the practical decision: upward adjustment, downward adjustment, maintain/reject, or unclear adjustment.
+- If the worker clearly wants a height change but the direction is unclear, return `ask_clarification`.
+- If the worker clearly wants the current height/posture to stay the same, return `reject`.
+- Do not treat acknowledgment, comprehension, or vague procedural phrases as maintain/reject.
+- If the utterance only says the worker understood, asks to do it again, or says "do that" without clear upward/downward/maintain meaning, return `ask_clarification`.
 
-If the worker says approval words such as:
-“응”, “네”, “예”, “그래”, “좋아”, “맞아”, “오케이”, “해줘”, “조정해줘”
+### 1. Directionless approval or adjustment request
+
+If the worker says directionless approval or adjustment words such as:
+“응”, “네”, “예”, “그래”, “좋아”, “맞아”, “오케이”, “해줘”, “조정해줘”, “바꿔주세요”, “변경해 주세요”, “알겠어요”, “알아들었어요”, “알아 먹었어”, “다시 해줘”, “그렇게 해줘”
 
 Return:
-- `action`: `approve`
-- `target_shoulder_angle_deg`: choose using COMMON TARGET ANGLE RULES
+- `action`: `ask_clarification`
+- `target_shoulder_angle_deg`: `null`
 - `is_invalid`: `false`
+- `clarification_question`: “높이를 유지할지, 올릴지, 내릴지 말씀해 주세요.”
 
-Do not simply use `current_angle - 20`.
+Do not infer upward or downward adjustment from directionless approval.
+Use `adjust` only when the worker clearly says an upward or downward direction.
 
 ### 2. Clear rejection or maintain
 
 If the worker says rejection or maintain words such as:
-“아니”, “아니요”, “괜찮아”, “그대로”, “그냥 둬”, “하지 마”, “필요 없어”, “됐어”
+“아니”, “아니요”, “괜찮아”, “그대로”, “그냥 둬”, “하지 마”, “필요 없어”, “됐어”, “유지해 주세요”, “이대로 할게요”, “현재 높이가 좋아요”
 
 Return:
 - `action`: `reject`
@@ -227,11 +257,11 @@ Even if posture risk is high, respect clear rejection.
 ### 3. Downward adjustment or burden expression
 
 If the worker says downward or burden words such as:
-“낮춰줘”, “내려줘”, “아래로”, “높아”, “너무 높아”, “팔이 올라가”, “팔이 너무 올라가”, “어깨가 부담돼”, “어깨가 불편해”, “팔이 불편해”
+“낮춰줘”, “낮추겠습니다”, “낮출게요”, “내려줘”, “내려 주세요”, “내리겠습니다”, “내릴게요”, “아래로”, “조금 낮게 해주세요”, “높아”, “너무 높아”, “팔이 올라가”, “팔이 너무 올라가”, “어깨가 부담돼”, “어깨가 불편해”, “팔이 불편해”
 
 Return:
 - `action`: `adjust`
-- target angle must be lower than current average shoulder angle
+- target angle must be lower than `cycle_representative_shoulder_angle_deg`
 - choose the target using COMMON TARGET ANGLE RULES
 
 Small request words:
@@ -239,18 +269,26 @@ Small request words:
 If current angle is already near 60-85 deg, reduce only 5-10 deg.
 
 Strong request words:
-“많이”, “더”, “확”, “너무 불편해”, “팔이 너무 올라가”, “어깨가 너무 부담돼” -> stronger reduction, often 75-85 deg when risk is high.
+“많이”, “더”, “확”, “너무 불편해”, “팔이 너무 올라가”, “어깨가 너무 부담돼” -> stronger reduction, often 40-50 deg when risk is high.
 
 ### 4. Upward request
 
 If the worker says upward words such as:
-“올려줘”, “높여줘”, “위로”
+“올려줘”, “올리겠습니다”, “올릴게요”, “높여줘”, “더 높게 해주세요”, “위로”, “위쪽으로 해주세요”
 
 Return:
-- `action`: `reject`
-- `target_shoulder_angle_deg`: `null`
+- If `metadata.condition.lead` is `"Worker"`:
+  - `action`: `adjust`
+  - `target_shoulder_angle_deg`: higher than `cycle_representative_shoulder_angle_deg`
+  - small request words such as “조금”, “살짝”, “약간”: increase about 10-15 deg
+  - normal upward request: increase about 10-15 deg
+  - strong request words such as “많이”, “더”, “확”: increase about 40-50 deg
+  - avoid targets above 120 deg unless there is an unusually strong reason
+- If `metadata.condition.lead` is not `"Worker"`:
+  - `action`: `reject`
+  - `target_shoulder_angle_deg`: `null`
 - `is_invalid`: `false`
-- `reason`: explain in Korean that upward adjustment does not match the shoulder-burden reduction goal.
+- `reason`: explain in Korean that the worker requested upward adjustment, or that upward adjustment is not accepted outside Worker-led conditions.
 
 If the utterance later corrects itself, follow the last clear intent.
 Examples:
@@ -275,7 +313,7 @@ If multiple intents appear in one utterance, follow the last clear intent.
 
 Examples:
 - “올려줘, 아니 그냥 둬” -> `reject`
-- “아니 됐어, 아니야 조정해줘” -> `approve`
+- “아니 됐어, 아니야 조정해줘” -> `ask_clarification`
 - “조금 낮춰줘, 아니 그대로 해” -> `reject`
 - “올려줘, 아니 내려줘” -> `adjust`
 - “낮춰줘, 아니 괜찮아” -> `reject`
@@ -291,7 +329,7 @@ Return:
 - `action`: `ask_clarification`
 - `target_shoulder_angle_deg`: `null`
 - `is_invalid`: `false`
-- `clarification_question`: “높이 조정을 진행하겠다는 뜻인가요? 조정하려면 ‘조정해줘’ 또는 ‘낮춰줘’라고 다시 말씀해 주세요.”
+- `clarification_question`: “높이를 유지할지, 올릴지, 내릴지 말씀해 주세요.”
 
 If the utterance is clearly unrelated or noise, return `unknown`.
 
@@ -365,7 +403,7 @@ Output:
   "reason": "위험 cycle이 아니므로 다음 전달 높이를 조정하지 않는다."
 }
 
-### Example 3: Worker + LLM, 명확한 승인, 높은 위험
+### Example 3: Worker + LLM, 방향 없는 조정 요청
 
 Input summary:
 - context: adjustment_response
@@ -380,12 +418,12 @@ Input summary:
 
 Output:
 {
-  "action": "approve",
-  "target_shoulder_angle_deg": 90.0,
-  "confidence": 0.93,
+  "action": "ask_clarification",
+  "target_shoulder_angle_deg": null,
+  "confidence": 0.70,
   "is_invalid": false,
-  "clarification_question": "",
-  "reason": "작업자가 조정을 승인했고 자세 위험이 높아 작업 가능 범위에 가까운 목표각을 선택한다."
+  "clarification_question": "높이를 유지할지, 올릴지, 내릴지 말씀해 주세요.",
+  "reason": "작업자가 조정을 원한다고 했지만 올림/내림 방향이 명확하지 않다."
 }
 
 ### Example 4: Worker + LLM, 명확한 거절
@@ -514,7 +552,7 @@ Output:
   "target_shoulder_angle_deg": null,
   "confidence": 0.55,
   "is_invalid": false,
-  "clarification_question": "높이 조정을 진행하겠다는 뜻인가요? 조정하려면 ‘조정해줘’ 또는 ‘낮춰줘’라고 다시 말씀해 주세요.",
+  "clarification_question": "높이를 유지할지, 올릴지, 내릴지 말씀해 주세요.",
   "reason": "음성 인식 결과가 높이 조정 의도와 직접 일치하지 않아 확인이 필요하다."
 }
 

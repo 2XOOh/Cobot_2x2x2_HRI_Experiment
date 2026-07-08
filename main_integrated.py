@@ -25,7 +25,7 @@ from voice_intent_interface import (
 # =========================================================
 # API 및 환경 설정
 # =========================================================
-OPENAI_API_KEY = ""
+OPENAI_API_KEY = "api-key"
 LLAMA_BASE_URL = "https://api.groq.com/openai/v1"
 
 INITIAL_SHOULDER_ANGLE_DEG = 130.0
@@ -33,7 +33,7 @@ MAX_EXPERIMENT_TIME_SEC = 480.0
 RULE_SHOULDER_REDUCTION_DEG = 20.0
 ROBOT_STATE_POLL_SEC = 0.2
 RISK_SHOULDER_DEG = 110.0
-RISKY_CYCLE_RATIO_THRESHOLD = 0.80
+RISKY_CYCLE_RATIO_THRESHOLD = 0.70
 RULA_HIGH_SCORE_THRESHOLD = 3.0
 
 CAMERA_FRAME_WIDTH = 1280
@@ -61,6 +61,11 @@ def speak(text):
     tts_speaker.speak(text)
 
 
+def speak_and_wait(text, timeout_sec=None):
+    speak(text)
+    tts_speaker.wait_until_done(timeout_sec=timeout_sec)
+
+
 def decide_returning_policy(condition, is_risky_cycle):
     # 조건별 주도권과 위험 cycle 여부에 따라 유지/자동보정/작업자질문을 결정한다.
     lead_type = condition["lead"]
@@ -74,10 +79,30 @@ def decide_returning_policy(condition, is_risky_cycle):
             "is_risky": is_risky_cycle,
         }
 
+    if lead_type == "Worker":
+        if control_type == "LLM":
+            message = (
+                "불편자세를 감지했습니다. 작업 높이를 변경해드릴까요?"
+                if is_risky_cycle
+                else "안전자세가 감지되었으나 작업높이를 변경해드릴까요?"
+            )
+        else:
+            message = (
+                "자세 부담이 감지되었습니다. 작업높이를 변경할까요?"
+                if is_risky_cycle
+                else "작업높이를 변경할까요?"
+            )
+        return {
+            "mode": "ask_worker",
+            "message": message,
+            "should_adjust": False,
+            "is_risky": is_risky_cycle,
+        }
+
     if not is_risky_cycle:
         return {
             "mode": "auto",
-            "message": "안전한 자세입니다. 동일한 높이로 다음 사이클을 진행합니다.",
+            "message": "안전자세가 감지되어 유지합니다.",
             "should_adjust": False,
             "is_risky": False,
         }
@@ -85,7 +110,7 @@ def decide_returning_policy(condition, is_risky_cycle):
     if lead_type == "System":
         return {
             "mode": "auto",
-            "message": "방금 전 위험 자세가 감지되어 시스템이 다음 높이를 보정합니다.",
+            "message": "불편자세가 감지되어 조정합니다.",
             "should_adjust": True,
             "is_risky": True,
         }
@@ -163,6 +188,13 @@ def main():
 
     # 카메라 파일은 프레임마다 자세값을 만들고 화면용 skeleton을 그린다.
     cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[CAMERA ERROR] 카메라를 열 수 없어 실험을 시작하지 않습니다.")
+        cap.release()
+        speech_recognizer.stop()
+        tts_speaker.stop()
+        return
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_FRAME_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_FRAME_HEIGHT)
     cv2.namedWindow(DISPLAY_WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -176,6 +208,13 @@ def main():
         rula_high_score_threshold=RULA_HIGH_SCORE_THRESHOLD,
     )
     data_logger = ExperimentDataLogger(RESULT_DIR)
+
+    def save_pass_goal_json(payload, label):
+        try:
+            json_path = data_logger.write_pass_goal_json(payload, label)
+            print(f"[PASS_GOAL JSON 저장] {json_path}")
+        except Exception as e:
+            print(f"[PASS_GOAL JSON 저장 실패] {e}")
 
     trial_count = 0
     wait_start_time = 0.0
@@ -251,7 +290,14 @@ def main():
             # Rule은 대표 어깨각에서 20도를 낮추고, LLM은 응답 목표각을 쓴다.
             if target_shoulder_angle_deg is not None:
                 target_angle_deg = max(0.0, min(180.0, float(target_shoulder_angle_deg)))
-                target_angle_source = "llm"
+                if response_source == "rule" and response_action == "adjust":
+                    target_angle_source = (
+                        "rule_avg_plus_20deg"
+                        if target_angle_deg >= cycle.representative_shoulder_angle_deg
+                        else "rule_avg_minus_20deg"
+                    )
+                else:
+                    target_angle_source = "llm"
             else:
                 target_angle_deg = max(
                     0.0,
@@ -283,7 +329,10 @@ def main():
         robot_command_sent = False
         if should_send_next_goal:
             payload = pose_result.to_pass_goal_dict(msg=f"Trial {trial_count} Setup")
+            save_pass_goal_json(payload, f"trial_{trial_count:03d}_pass_goal")
             robot_command_sent = SendPassGoal(payload)
+            if not robot_command_sent:
+                print("[PASS_GOAL 실패] 다음 목표가 로봇으로 전송되지 않았습니다.")
         else:
             print("[PASS_GOAL 생략] 이전 목표를 그대로 유지합니다.")
 
@@ -359,9 +408,11 @@ def main():
 
     # 카메라 화면에서 자세를 확인하고 S를 누르면 초기 goal 전송과 8분 타이머를 시작한다.
     print("[START READY] 카메라 화면을 확인한 뒤 S를 누르면 실험을 시작합니다. Q/ESC는 종료입니다.")
+    started = False
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
+            print("[CAMERA ERROR] 시작 대기 중 프레임을 읽지 못해 실험을 시작하지 않습니다.")
             break
 
         posture_sample = posture_estimator.process_frame(frame)
@@ -378,6 +429,7 @@ def main():
 
         start_key = cv2.waitKey(10) & 0xFF
         if start_key in (ord("s"), ord("S")):
+            started = True
             break
         if start_key in (27, ord("q"), ord("Q")):
             posture_estimator.close()
@@ -387,7 +439,18 @@ def main():
             tts_speaker.stop()
             return
 
-    SendPassGoal(initial_pose.to_pass_goal_dict(msg="Initial Trial Setup"))
+    if not started:
+        posture_estimator.close()
+        cap.release()
+        cv2.destroyAllWindows()
+        speech_recognizer.stop()
+        tts_speaker.stop()
+        return
+
+    initial_payload = initial_pose.to_pass_goal_dict(msg="Initial Trial Setup")
+    save_pass_goal_json(initial_payload, "initial_pass_goal")
+    speak_and_wait("실험을 시작하겠습니다. 바른 자세로 로봇을 바라보고 앉아주세요.")
+    SendPassGoal(initial_payload)
     SetReviewPending(False)
     experiment_start_time = time.time()
     key = -1
@@ -441,7 +504,7 @@ def main():
         if entered_at_task:
             speech_recognizer.get_and_clear()
             if previous_robot_state != "AT_TASK":
-                speak("블록의 네 개 구멍에 볼트를 체결해 주세요.")
+                speak("블록의 네 개 볼트에 있는 너트를 드릴로 빼주세요.")
             metrics.start_cycle()
             current_cycle_result = None
             last_task_sample_time = 0.0
@@ -476,6 +539,8 @@ def main():
             user_response_text = ""
             policy = decide_returning_policy(current_condition, current_cycle_result.is_risky_cycle)
             speak(policy["message"])
+            if policy["mode"] == "ask_worker":
+                tts_speaker.wait_until_done()
 
             if policy["mode"] == "auto":
                 if policy["is_risky"] and current_condition["lead"] == "System":
@@ -563,7 +628,10 @@ def main():
                 2,
             )
 
-            if current_voice or worker_response["source"] == "manual":
+            if (
+                worker_response["action"] != "ignored"
+                and (current_voice or worker_response["source"] == "manual")
+            ):
                 print(
                     f"[작업자 답변]: '{worker_response['text']}' -> "
                     f"{worker_response['action']} ({worker_response['source']})"
@@ -573,7 +641,7 @@ def main():
                 metrics.record_llm_call(worker_response["latency"])
 
             if worker_response["action"] == "ask_clarification" and worker_response["clarification_question"]:
-                speak(worker_response["clarification_question"])
+                speak_and_wait(worker_response["clarification_question"])
                 speech_recognizer.get_and_clear()
 
             if worker_response["answered"]:
@@ -589,9 +657,11 @@ def main():
                     llm_confidence=worker_response["confidence"],
                     decision_reason=worker_response["reason"],
                 )
-            elif current_voice and worker_response["action"] != "ask_clarification":
+            elif current_voice and worker_response["action"] not in ("ask_clarification", "ignored"):
                 if worker_response["is_invalid"]:
                     metrics.record_invalid_command()
+                speak_and_wait("잘 인식하지 못했습니다. 다시 말씀해 주세요.")
+                speech_recognizer.get_and_clear()
                 print("[작업자 답변 해석 실패] 다시 답변을 기다립니다.")
 
         # IDLE에서는 한 cycle 흐름을 마치고 대기 상태로 정리한다.
@@ -656,7 +726,7 @@ def main():
     )
     data_logger.write_summary(summary_record)
 
-    speak("수고하셨습니다. 실험이 종료되었습니다.")
+    speak_and_wait("수고하셨습니다. 실험이 종료되었습니다.")
     tts_speaker.stop()
 
 

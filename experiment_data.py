@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -362,12 +364,28 @@ class ExperimentDataLogger:
         os.makedirs(result_dir, exist_ok=True)
         self.raw_path = os.path.join(result_dir, "experiment_raw_data_per_trial.csv")
         self.summary_path = os.path.join(result_dir, "experiment_summary_matrix.csv")
+        self.pass_goal_dir = os.path.join(result_dir, "pass_goal_json")
+        os.makedirs(self.pass_goal_dir, exist_ok=True)
+        self._pass_goal_json_index = 0
 
     def write_trial(self, record: TrialRecord) -> None:
         self._append_row(self.raw_path, self.RAW_HEADER, self._trial_to_row(record))
 
     def write_summary(self, record: SummaryRecord) -> None:
         self._append_row(self.summary_path, self.SUMMARY_HEADER, self._summary_to_row(record))
+
+    def write_pass_goal_json(self, payload: dict[str, Any], label: str) -> str:
+        self._pass_goal_json_index += 1
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        safe_label = _safe_filename_part(label)
+        filename = f"{timestamp}_{self._pass_goal_json_index:03d}_{safe_label}.json"
+        path = os.path.join(self.pass_goal_dir, filename)
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+        return path
 
     def _append_row(self, filename: str, header: list[str], row: list[Any]) -> None:
         header_needed = not os.path.isfile(filename) or os.path.getsize(filename) == 0
@@ -481,3 +499,9 @@ def _round(value: float | None, digits: int) -> float | str:
     if value is None:
         return ""
     return round(float(value), digits)
+
+
+def _safe_filename_part(value: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(value))
+    safe = safe.strip("_")
+    return safe or "pass_goal"

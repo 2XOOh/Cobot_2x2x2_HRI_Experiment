@@ -102,7 +102,7 @@ def SetReviewPending(pending, timeout_sec=2.0, base_url=BASE_RECEIVER_URL):
         return False
 
 
-def GetRobotState(timeout_sec=1.0, base_url=BASE_RECEIVER_URL):
+def GetRobotState(timeout_sec=0.1, base_url=BASE_RECEIVER_URL):
     """
     현재 로봇 상태 문자열을 읽어옵니다.
     """

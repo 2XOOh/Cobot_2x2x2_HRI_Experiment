@@ -11,9 +11,101 @@ from typing import Any, Callable
 
 
 DEFAULT_SYSTEM_PROMPT_PATH = Path(__file__).with_name("prompts") / "worker_intent_system.md"
+# The keyword lists below are used by RuleIntentParser and simple non-LLM checks.
+# Worker + LLM conditions send the full utterance to the LLM prompt instead.
 TASK_COMPLETION_KEYWORDS = ("끝", "완료", "다했", "다 했", "체결", "조립", "마무리", "오케이")
 APPROVE_KEYWORDS = ("응", "어", "네", "예", "그래", "좋아", "오케이", "ok", "맞아", "해줘", "조정")
 REJECT_KEYWORDS = ("아니", "아니요", "괜찮", "그대로", "하지마", "필요없", "됐어", "no", "노")
+UPWARD_ADJUST_KEYWORDS = ("올려", "올리", "높여", "위로", "높게")
+DOWNWARD_ADJUST_KEYWORDS = ("낮춰", "낮추", "내려", "내리", "아래로", "낮게")
+LLM_ACTION_CONFIDENCE_THRESHOLD = 0.75
+AMBIGUOUS_ASR_PHRASES = (
+    "알겠",
+    "알았",
+    "알아먹",
+    "알아들",
+    "다시해",
+    "그렇게해",
+    "그걸로해",
+    "그냥해",
+)
+DIRECTIONLESS_ADJUSTMENT_HINTS = ("조정", "변경", "바꿔", "바꾸")
+DIRECTION_OR_MAINTAIN_HINTS = (
+    *UPWARD_ADJUST_KEYWORDS,
+    *DOWNWARD_ADJUST_KEYWORDS,
+    *REJECT_KEYWORDS,
+    "유지",
+    "이대로",
+    "현재",
+    "위쪽",
+    "아래쪽",
+)
+IGNORED_TTS_ECHO_PHRASES = (
+    "인식하지못",
+    "다시말씀",
+    "유지할지올릴지내릴지",
+    "높이를유지할지",
+    "불편자세를감지",
+    "안전자세가감지",
+    "작업높이를변경해드릴까요",
+    "작업높이를변경할까요",
+)
+DIRECTIONLESS_CONFIRMATION_PHRASES = (
+    "응",
+    "어",
+    "네",
+    "예",
+    "그래",
+    "좋아",
+    "오케이",
+    "ok",
+    "맞아",
+    "해줘",
+    "해주세요",
+    "조정해줘",
+    "조정해주세요",
+    "바꿔줘",
+    "바꿔주세요",
+    "변경해줘",
+    "변경해주세요",
+    "알겠어",
+    "알겠어요",
+    "알겠습니다",
+    "알았어",
+    "알았어요",
+    "알았습니다",
+    "알아먹었어",
+    "알아먹었어요",
+    "알아들었어",
+    "알아들었어요",
+)
+HEIGHT_POSTURE_HINTS = (
+    "높이",
+    "자세",
+    "어깨",
+    "팔",
+    "불편",
+    "부담",
+    "편하",
+    "편해",
+    "위쪽",
+    "위로",
+    "아래",
+    "낮",
+    "높",
+    "내려",
+    "내리",
+    "올려",
+    "올리",
+    "유지",
+    "그대로",
+    "괜찮",
+    "필요없",
+    "됐어",
+    "조정",
+    "변경",
+    "바꿔",
+)
 
 
 @dataclass
@@ -207,12 +299,17 @@ def parse_worker_adjustment_input(
     if manual_action:
         response.update(
             {
-                "answered": True,
+                "answered": manual_action in ("reject", "adjust"),
                 "text": f"[Manual] {manual_action} adjustment",
                 "action": manual_action,
                 "source": "manual",
                 "reason": "matched manual key",
                 "confidence": 1.0,
+                "clarification_question": (
+                    "높이를 유지할지, 올릴지, 내릴지 말씀해 주세요."
+                    if manual_action == "ask_clarification"
+                    else ""
+                ),
             }
         )
         return response
@@ -221,6 +318,16 @@ def parse_worker_adjustment_input(
         return response
 
     response["text"] = voice_text
+    if _is_tts_echo(voice_text):
+        response.update(
+            {
+                "action": "ignored",
+                "source": "ignored",
+                "reason": "ignored likely TTS echo",
+            }
+        )
+        return response
+
     if control_type == "LLM" and llm_parser is not None:
         llm_start_time = time.time()
         llm_decision = llm_parser.parse(
@@ -240,18 +347,51 @@ def parse_worker_adjustment_input(
                 "clarification_question": llm_decision.clarification_question,
             }
         )
+        retry_reason = _llm_worker_retry_reason(voice_text, response)
+        if retry_reason:
+            response.update(
+                {
+                    "answered": False,
+                    "action": "unknown",
+                    "target_shoulder_angle_deg": None,
+                    "is_invalid": True,
+                    "reason": retry_reason,
+                    "clarification_question": "",
+                }
+            )
+            return response
+
         response["answered"] = llm_decision.action in ("approve", "reject", "adjust")
         return response
 
-    action = rule_parser.parse(voice_text, context="adjustment_response")
+    raw_action = rule_parser.parse(voice_text, context="adjustment_response")
+    action = "adjust" if raw_action in ("adjust_up", "adjust_down") else raw_action
+    target_shoulder_angle_deg = (
+        _rule_target_shoulder_angle(
+            metadata,
+            direction=1.0 if raw_action == "adjust_up" else -1.0,
+        )
+        if raw_action in ("adjust_up", "adjust_down")
+        else None
+    )
+    if raw_action in ("adjust_up", "adjust_down") and target_shoulder_angle_deg is None:
+        action = "unknown"
+    clarification_question = (
+        "높이를 유지할지, 올릴지, 내릴지 말씀해 주세요."
+        if action == "ask_clarification"
+        else ""
+    )
+
     response.update(
         {
-            "answered": action in ("approve", "reject"),
+            "answered": action in ("approve", "reject", "adjust"),
             "action": action,
+            "target_shoulder_angle_deg": target_shoulder_angle_deg,
             "source": "rule",
             "reason": "matched rule keyword" if action != "unknown" else "no rule matched",
             "confidence": 1.0 if action != "unknown" else 0.0,
             "is_invalid": action == "unknown",
+            "clarification_question": clarification_question,
         }
     )
     return response
@@ -260,10 +400,73 @@ def parse_worker_adjustment_input(
 def _manual_adjustment_action(key: int) -> str | None:
     # Worker 응답 대기 중 Y/N 키를 approve/reject로 바꾼다.
     if key in (ord("y"), ord("Y")):
-        return "approve"
+        return "ask_clarification"
     if key in (ord("n"), ord("N")):
         return "reject"
     return None
+
+
+def _rule_target_shoulder_angle(metadata: dict[str, Any] | None, direction: float) -> float | None:
+    if not isinstance(metadata, dict):
+        return None
+    try:
+        current_angle = float(metadata["cycle_representative_shoulder_angle_deg"])
+        step_deg = float(metadata.get("rule_shoulder_reduction_deg", 20.0))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return max(0.0, min(180.0, current_angle + direction * step_deg))
+
+
+def _llm_worker_retry_reason(voice_text: str, response: dict[str, Any]) -> str:
+    action = str(response.get("action", "unknown"))
+    if action not in ("approve", "reject", "adjust"):
+        return ""
+
+    try:
+        confidence = float(response.get("confidence", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+
+    if confidence < LLM_ACTION_CONFIDENCE_THRESHOLD:
+        return (
+            f"LLM confidence {confidence:.2f} is below "
+            f"{LLM_ACTION_CONFIDENCE_THRESHOLD:.2f}; asking worker to repeat."
+        )
+
+    if action in ("approve", "adjust") and response.get("target_shoulder_angle_deg") is None:
+        return "LLM selected height adjustment without a target angle; asking worker to repeat."
+
+    normalized = _normalize(voice_text)
+    if _is_directionless_confirmation(normalized):
+        return "Directionless confirmation should be clarified before changing height."
+
+    if _is_directionless_adjustment_request(normalized):
+        return "Directionless adjustment request should be clarified before changing height."
+
+    if _is_ambiguous_asr_phrase(normalized):
+        return "Ambiguous ASR-like phrase lacks a clear height/posture intent."
+
+    return ""
+
+
+def _is_directionless_confirmation(normalized: str) -> bool:
+    return any(normalized == _normalize(phrase) for phrase in DIRECTIONLESS_CONFIRMATION_PHRASES)
+
+
+def _is_directionless_adjustment_request(normalized: str) -> bool:
+    if not _has_any(normalized, DIRECTIONLESS_ADJUSTMENT_HINTS):
+        return False
+    return not _has_any(normalized, DIRECTION_OR_MAINTAIN_HINTS)
+
+
+def _is_ambiguous_asr_phrase(normalized: str) -> bool:
+    if not _has_any(normalized, AMBIGUOUS_ASR_PHRASES):
+        return False
+    return not _has_any(normalized, HEIGHT_POSTURE_HINTS)
+
+
+def _is_tts_echo(text: str) -> bool:
+    return _has_any(_normalize(text), IGNORED_TTS_ECHO_PHRASES)
 
 
 def _normalize(text: str) -> str:
@@ -290,8 +493,14 @@ class RuleIntentParser:
         if context == "adjustment_response" and _has_any(normalized, REJECT_KEYWORDS):
             return "reject"
 
+        if context == "adjustment_response" and _has_any(normalized, UPWARD_ADJUST_KEYWORDS):
+            return "adjust_up"
+
+        if context == "adjustment_response" and _has_any(normalized, DOWNWARD_ADJUST_KEYWORDS):
+            return "adjust_down"
+
         if context == "adjustment_response" and _has_any(normalized, APPROVE_KEYWORDS):
-            return "approve"
+            return "ask_clarification"
 
         if context == "any" and _has_any(normalized, TASK_COMPLETION_KEYWORDS):
             return "complete"
