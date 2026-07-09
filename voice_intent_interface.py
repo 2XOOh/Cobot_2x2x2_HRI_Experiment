@@ -13,13 +13,32 @@ from typing import Any, Callable
 DEFAULT_SYSTEM_PROMPT_PATH = Path(__file__).with_name("prompts") / "worker_intent_runtime.md"
 # The keyword lists below are used by RuleIntentParser and simple non-LLM checks.
 # Worker + LLM conditions send the full utterance to the LLM prompt instead.
-TASK_COMPLETION_KEYWORDS = ("끝", "완료", "다했", "다 했", "체결", "조립", "마무리", "오케이")
+TASK_COMPLETION_KEYWORDS = (
+    "끝",
+    "종료",
+    "완료",
+    "다했",
+    "다 했",
+    "다됐",
+    "다 됐",
+    "끝냈",
+    "끝났",
+    "마쳤",
+    "마무리",
+    "다뺐",
+    "다 뺐",
+    "다풀었",
+    "다 풀었",
+    "finished",
+    "done",
+)
 APPROVE_KEYWORDS = ("응", "어", "네", "예", "그래", "좋아", "오케이", "ok", "맞아", "해줘", "조정")
 REJECT_KEYWORDS = ("아니", "아니요", "괜찮", "그대로", "하지마", "필요없", "됐어", "no", "노")
 UPWARD_ADJUST_KEYWORDS = ("올려", "올리", "높여", "위로", "높게")
 DOWNWARD_ADJUST_KEYWORDS = ("낮춰", "낮추", "내려", "내리", "아래로", "낮게")
 LLM_ACTION_CONFIDENCE_THRESHOLD = 0.75
 RULE_WORKER_UP_STEP_DEG = 10.0
+RULE_WORKER_DOWN_STEP_DEG = 10.0
 RULE_MIN_ANGLE_TOLERANCE_DEG = 1.0
 AMBIGUOUS_ASR_PHRASES = (
     "알겠",
@@ -285,11 +304,37 @@ class ContinuousSpeechRecognizer:
                     continue
 
 
-def is_task_completion_input(key: int, voice_text: str | None) -> bool:
-    # SPACE 키나 단순 완료 키워드가 들어왔는지 바로 판별한다.
+def is_task_completion_input(
+    key: int,
+    voice_text: str | None,
+    llm_parser: "LlmIntentParser | None" = None,
+    metadata: dict[str, Any] | None = None,
+) -> bool:
+    # 명확한 완료 표현은 즉시 처리하고, 나머지는 LLM으로 종료 의미를 해석한다.
     if key == ord(" "):
         return True
-    return _has_any(_normalize(voice_text or ""), TASK_COMPLETION_KEYWORDS)
+
+    normalized = _normalize(voice_text or "")
+    if not normalized:
+        return False
+    if _has_any(normalized, TASK_COMPLETION_KEYWORDS):
+        return True
+    if llm_parser is None:
+        return False
+
+    decision = llm_parser.parse(
+        voice_text,
+        context="task_completion",
+        metadata=metadata,
+    )
+    if decision.source == "llm_error":
+        print(f"[작업 완료 LLM 오류] {decision.reason}")
+        return False
+    return (
+        decision.action == "complete"
+        and decision.confidence >= LLM_ACTION_CONFIDENCE_THRESHOLD
+        and not decision.is_invalid
+    )
 
 
 def parse_worker_adjustment_input(
@@ -397,7 +442,15 @@ def parse_worker_adjustment_input(
         if llm_decision.source == "llm_error":
             return response
 
-        retry_reason = _llm_worker_retry_reason(voice_text, response, metadata)
+        if response["action"] == "ask_clarification" and not response["clarification_question"]:
+            response["clarification_question"] = "높이를 유지할지, 올릴지, 내릴지 말씀해 주세요."
+
+        retry_reason = _llm_worker_retry_reason(
+            voice_text,
+            response,
+            metadata,
+            validate_target=control_type == "LLM",
+        )
         if retry_reason:
             response.update(
                 {
@@ -443,18 +496,23 @@ def resolve_rule_worker_target_angle_by_policy(
         return None
 
     try:
-        current_angle = float(metadata["current_robot_shoulder_angle_deg"])
+        current_angle = float(metadata["cycle_representative_shoulder_angle_deg"])
         effective_min = float(metadata["effective_min_shoulder_deg"])
+        safe_max = float(metadata.get("pilot_functional_max_shoulder_deg", 80.0))
         up_step_deg = float(metadata.get("rule_worker_up_step_deg", RULE_WORKER_UP_STEP_DEG))
+        down_step_deg = float(
+            metadata.get("rule_worker_down_step_deg", RULE_WORKER_DOWN_STEP_DEG)
+        )
+        cycle_is_risky = bool(metadata.get("cycle_is_risky", False))
     except (KeyError, TypeError, ValueError):
         return None
 
     if direction == "up":
         return max(0.0, min(180.0, current_angle + up_step_deg))
     if direction == "down":
-        if current_angle <= effective_min + RULE_MIN_ANGLE_TOLERANCE_DEG:
-            return None
-        return max(0.0, min(180.0, effective_min))
+        if cycle_is_risky:
+            return max(effective_min, safe_max)
+        return max(0.0, min(180.0, current_angle - down_step_deg))
     return None
 
 
@@ -494,18 +552,6 @@ def _apply_rule_worker_policy(
         return response
 
     target_angle = resolve_rule_worker_target_angle_by_policy(metadata, direction)
-    if direction == "down" and target_angle is None:
-        response.update(
-            {
-                "answered": False,
-                "action": "limit_reached",
-                "target_shoulder_angle_deg": None,
-                "is_invalid": False,
-                "reason": "Worker requested lowering at the robot's effective minimum height.",
-            }
-        )
-        return response
-
     if target_angle is None:
         response.update(
             {
@@ -521,7 +567,11 @@ def _apply_rule_worker_policy(
     policy_reason = (
         "Rule policy applied current shoulder angle +10 degrees."
         if direction == "up"
-        else "Rule policy applied the worker-specific effective minimum shoulder angle."
+        else (
+            "Rule policy guided the risky posture to the safe-range upper bound."
+            if bool((metadata or {}).get("cycle_is_risky", False))
+            else "Rule policy applied current shoulder angle -10 degrees."
+        )
     )
     response.update(
         {
@@ -542,7 +592,7 @@ def _llm_adjustment_direction(
     if not isinstance(metadata, dict):
         return None
     try:
-        current_angle = float(metadata["current_robot_shoulder_angle_deg"])
+        current_angle = float(metadata["cycle_representative_shoulder_angle_deg"])
         llm_target = float(response["target_shoulder_angle_deg"])
     except (KeyError, TypeError, ValueError):
         return None
@@ -564,6 +614,7 @@ def _llm_worker_retry_reason(
     voice_text: str,
     response: dict[str, Any],
     metadata: dict[str, Any] | None = None,
+    validate_target: bool = True,
 ) -> str:
     action = str(response.get("action", "unknown"))
     if action not in ("approve", "reject", "adjust"):
@@ -580,7 +631,11 @@ def _llm_worker_retry_reason(
             f"{LLM_ACTION_CONFIDENCE_THRESHOLD:.2f}; asking worker to repeat."
         )
 
-    if action in ("approve", "adjust") and response.get("target_shoulder_angle_deg") is None:
+    if (
+        validate_target
+        and action in ("approve", "adjust")
+        and response.get("target_shoulder_angle_deg") is None
+    ):
         return "LLM selected height adjustment without a target angle; asking worker to repeat."
 
     if action in ("approve", "adjust"):
@@ -588,7 +643,9 @@ def _llm_worker_retry_reason(
         if direction not in ("up", "down"):
             return "LLM selected height adjustment without a clear direction."
 
+    if validate_target and action in ("approve", "adjust"):
         try:
+            current_worker_angle = float((metadata or {})["cycle_representative_shoulder_angle_deg"])
             current_robot_angle = float((metadata or {})["current_robot_shoulder_angle_deg"])
             target_angle = float(response["target_shoulder_angle_deg"])
             effective_min = float((metadata or {})["effective_min_shoulder_deg"])
@@ -599,11 +656,11 @@ def _llm_worker_retry_reason(
         tolerance_deg = RULE_MIN_ANGLE_TOLERANCE_DEG
         at_lower_limit = current_robot_angle <= effective_min + tolerance_deg
         at_upper_limit = current_robot_angle >= robot_max - tolerance_deg
-        if direction == "up" and target_angle <= current_robot_angle:
-            if not (at_upper_limit and target_angle >= current_robot_angle - tolerance_deg):
+        if direction == "up" and target_angle <= current_worker_angle:
+            if not (at_upper_limit and target_angle >= current_worker_angle - tolerance_deg):
                 return "Upward intent produced a non-upward target angle."
-        if direction == "down" and target_angle >= current_robot_angle:
-            if not (at_lower_limit and target_angle <= current_robot_angle + tolerance_deg):
+        if direction == "down" and target_angle >= current_worker_angle:
+            if not (at_lower_limit and target_angle <= current_worker_angle + tolerance_deg):
                 return "Downward intent produced a non-downward target angle."
 
     normalized = _normalize(voice_text)
@@ -717,26 +774,43 @@ class LlmIntentParser:
         user_content = self._build_user_content(raw_text, context, metadata)
 
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                temperature=self.temperature,
-                max_tokens=200,
-                response_format={"type": "json_object"},
-            )
+            response = self._create_completion(system_prompt, user_content)
             content = response.choices[0].message.content or "{}"
             parsed = json.loads(content.strip())
             return self._result_from_json(parsed, raw_text)
         except Exception as exc:
+            if "json_validate_failed" in str(exc):
+                try:
+                    repair_prompt = (
+                        system_prompt
+                        + "\nCRITICAL JSON REPAIR: Return final numeric literals only. "
+                        + "Compute every addition or subtraction before writing JSON. "
+                        + "Do not put arithmetic operators in any JSON value."
+                    )
+                    response = self._create_completion(repair_prompt, user_content)
+                    content = response.choices[0].message.content or "{}"
+                    parsed = json.loads(content.strip())
+                    return self._result_from_json(parsed, raw_text)
+                except Exception as retry_exc:
+                    exc = retry_exc
             return LlmAdjustmentDecision(
                 raw_text=raw_text,
                 source="llm_error",
                 is_invalid=True,
                 reason=f"LLM intent parsing failed: {exc}",
             )
+
+    def _create_completion(self, system_prompt: str, user_content: str):
+        return self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=self.temperature,
+            max_tokens=200,
+            response_format={"type": "json_object"},
+        )
 
     def _build_user_content(
         self,
