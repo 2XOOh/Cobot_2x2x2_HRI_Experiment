@@ -405,27 +405,33 @@ def main():
             if target_shoulder_angle_deg is None:
                 raise ValueError("높이 조정에는 명시적인 목표 어깨각이 필요합니다.")
 
-            safe_guidance_required = (
-                current_condition["lead"] == "System"
+            rule_safe_guidance_required = (
+                response_source in ("system_rule", "system_rule_fallback")
                 or (
-                    current_condition["lead"] == "Worker"
+                    response_source == "rule_llm"
                     and cycle.is_risky_cycle
                     and response_direction == "down"
                 )
             )
             target_lower_bound = (
                 effective_min_shoulder_deg
-                if safe_guidance_required
+                if rule_safe_guidance_required
                 else robot_min_shoulder_deg
             )
             target_upper_bound = (
                 safe_range_upper_shoulder_deg
-                if safe_guidance_required
+                if rule_safe_guidance_required
                 else robot_max_shoulder_deg
             )
             target_angle_deg = max(
                 target_lower_bound,
                 min(target_upper_bound, float(target_shoulder_angle_deg)),
+            )
+            print(
+                "[최종 목표각] "
+                f"proposed={float(target_shoulder_angle_deg):.2f}도 | "
+                f"final={target_angle_deg:.2f}도 | "
+                f"allowed={target_lower_bound:.2f}~{target_upper_bound:.2f}도"
             )
             if response_source == "rule_llm":
                 if response_direction == "up":
@@ -787,7 +793,7 @@ def main():
                     f"[작업자 답변]: '{worker_response['text']}' -> "
                     f"{worker_response['action']} ({worker_response['source']}) | "
                     f"direction={worker_response['direction']} | "
-                    f"target={worker_response['target_shoulder_angle_deg']} | "
+                    f"proposed_target={worker_response['target_shoulder_angle_deg']} | "
                     f"confidence={worker_response['confidence']:.2f} | "
                     f"reason={worker_response['reason']}"
                 )

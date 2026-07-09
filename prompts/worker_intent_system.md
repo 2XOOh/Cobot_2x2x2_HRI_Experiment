@@ -190,6 +190,20 @@ Reachability-aware lower bound:
 
 Downward policy:
 
+- HIGHEST PRIORITY: when `context=adjustment_response`, the condition is
+  Worker+LLM, `metadata.cycle_is_risky=true`, and the utterance clearly requests
+  downward adjustment, the first response must contain the final absolute target
+  inside `[metadata.effective_min_shoulder_deg,
+  metadata.pilot_functional_max_shoulder_deg]`, normally 60-80 degrees.
+- This highest-priority case overrides all relative reductions. Do not return
+  `current-10`, `current-20`, `current-25`, or any other out-of-range proposal.
+- Request strength only selects a value within the safe range: small near the
+  upper bound, normal near the middle, and strong near the lower bound.
+- Example: current=121.91, effective_min=74.35, pilot_max=80, and "내려 주세요"
+  must return one final numeric target from 74.35 through 80, such as 77. It must
+  never return 104.91.
+- Check this range before emitting the first JSON response. Recalculate inside
+  the same response when needed; do not emit an out-of-range target.
 - In a Worker-led risky cycle, every downward request chooses inside the
   reachable 60-80 safe range; request strength selects upper/middle/lower parts.
 - In a Worker-led safe cycle, small/normal/strong downward requests reduce about
@@ -420,3 +434,5 @@ Before answering, check this:
 2. Include all required keys from OUTPUT FORMAT.
 3. Use numeric `target_shoulder_angle_deg` only for `approve` or `adjust`; otherwise use null.
 4. Do not output any Z-height field.
+5. For Worker+LLM risky-cycle downward requests, the first target must already
+   be within effective_min_shoulder_deg through pilot_functional_max_shoulder_deg.

@@ -57,7 +57,7 @@ class PostureEstimator:
         wrist_pt = landmark_to_pixel(landmarks[SELECTED_LANDMARKS["wrist"]], width, height)
         hip_pt = landmark_to_pixel(landmarks[SELECTED_LANDMARKS["hip"]], width, height)
 
-        shoulder_angle_deg = calculate_angle(hip_pt, shoulder_pt, elbow_pt)
+        shoulder_angle_deg = calculate_angle(hip_pt, shoulder_pt, wrist_pt)
         elbow_angle_deg = calculate_angle(shoulder_pt, elbow_pt, wrist_pt)
         rula_proxy = estimate_rula_score(shoulder_angle_deg, elbow_angle_deg)
 

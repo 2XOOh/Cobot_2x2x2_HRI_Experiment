@@ -52,6 +52,30 @@ Use these metadata values:
 the completed work cycle. Use it as the baseline for relative worker requests.
 `current_robot_shoulder_angle_deg` is only a physical robot-limit reference.
 
+### Highest-priority risky-cycle downward rule
+
+This rule overrides every relative downward rule below.
+
+- Apply it when all of these are true:
+  - `context=adjustment_response`
+  - `metadata.condition.lead=Worker`
+  - `metadata.condition.control=LLM`
+  - `metadata.cycle_is_risky=true`
+  - the utterance clearly requests downward adjustment
+- In the first and only response, return `action=adjust`, `direction=down`, and a
+  final absolute `target_shoulder_angle_deg` from `effective_min` through
+  `pilot_max`, normally 60-80 degrees.
+- The target is the final shoulder angle, not a subtraction amount and not
+  `current - 10`, `current - 20`, or `current - 25`.
+- Use request strength only to choose within that range: small nearer `pilot_max`,
+  normal in the middle, and strong nearer `effective_min`.
+- Example: if current=121.91, effective_min=74.35, pilot_max=80, and the worker
+  says "내려 주세요", return one final numeric target from 74.35 through 80,
+  such as 77. Never return 104.91.
+- Before emitting the JSON, verify that the target is within
+  `[effective_min, pilot_max]`. If it is not, calculate an in-range target before
+  emitting this same first response. Do not emit an out-of-range proposal.
+
 Downward:
 
 - If `cycle_is_risky=true`, a downward request accepts ergonomic guidance:
@@ -143,6 +167,9 @@ current nut-removal task is finished or clearly intends to end it now.
 - Return every required key.
 - `adjust` requires a numeric target.
 - `adjust` requires direction `up` or `down`.
+- For Worker+LLM risky-cycle downward requests, the first returned target must
+  already be within `effective_min_shoulder_deg` through
+  `pilot_functional_max_shoulder_deg`.
 - `complete` is used only for clear current task-completion intent.
 - Other actions require a null target.
 - Return valid JSON only.
