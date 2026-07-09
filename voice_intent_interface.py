@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-DEFAULT_SYSTEM_PROMPT_PATH = Path(__file__).with_name("prompts") / "worker_intent_system.md"
+DEFAULT_SYSTEM_PROMPT_PATH = Path(__file__).with_name("prompts") / "worker_intent_runtime.md"
 # The keyword lists below are used by RuleIntentParser and simple non-LLM checks.
 # Worker + LLM conditions send the full utterance to the LLM prompt instead.
 TASK_COMPLETION_KEYWORDS = ("끝", "완료", "다했", "다 했", "체결", "조립", "마무리", "오케이")
@@ -19,6 +19,8 @@ REJECT_KEYWORDS = ("아니", "아니요", "괜찮", "그대로", "하지마", "�
 UPWARD_ADJUST_KEYWORDS = ("올려", "올리", "높여", "위로", "높게")
 DOWNWARD_ADJUST_KEYWORDS = ("낮춰", "낮추", "내려", "내리", "아래로", "낮게")
 LLM_ACTION_CONFIDENCE_THRESHOLD = 0.75
+RULE_WORKER_UP_STEP_DEG = 10.0
+RULE_MIN_ANGLE_TOLERANCE_DEG = 1.0
 AMBIGUOUS_ASR_PHRASES = (
     "알겠",
     "알았",
@@ -49,6 +51,10 @@ IGNORED_TTS_ECHO_PHRASES = (
     "안전자세가감지",
     "작업높이를변경해드릴까요",
     "작업높이를변경할까요",
+    "현재로봇이전달할수있는최저높이",
+    "더낮춰서전달할수없습니다",
+    "현재로봇이전달할수있는최고높이",
+    "더높여서전달할수없습니다",
 )
 DIRECTIONLESS_CONFIRMATION_PHRASES = (
     "응",
@@ -78,6 +84,21 @@ DIRECTIONLESS_CONFIRMATION_PHRASES = (
     "알아먹었어요",
     "알아들었어",
     "알아들었어요",
+)
+DIRECTIONLESS_MODIFIER_PHRASES = (
+    "조금",
+    "조금만",
+    "조금만 더",
+    "살짝",
+    "약간",
+    "많이",
+    "확",
+    "더",
+    "엄청",
+    "엄청 조금만",
+    "조금만 해줘",
+    "살짝 해줘",
+    "약간 해줘",
 )
 HEIGHT_POSTURE_HINTS = (
     "높이",
@@ -112,6 +133,7 @@ HEIGHT_POSTURE_HINTS = (
 class LlmAdjustmentDecision:
     # LLM이 사용자 의도와 상태를 보고 조정 여부와 목표 어깨각을 판단한 결과를 담는다.
     action: str = "unknown"
+    direction: str = "unclear"
     target_shoulder_angle_deg: float | None = None
     confidence: float = 0.0
     reason: str = ""
@@ -285,6 +307,7 @@ def parse_worker_adjustment_input(
         "answered": False,
         "text": "",
         "action": "unknown",
+        "direction": "unclear",
         "elapsed_wait": elapsed_wait,
         "target_shoulder_angle_deg": None,
         "latency": 0.0,
@@ -328,7 +351,30 @@ def parse_worker_adjustment_input(
         )
         return response
 
-    if control_type == "LLM" and llm_parser is not None:
+    if _is_directionless_modifier(_normalize(voice_text)):
+        response.update(
+            {
+                "action": "ask_clarification",
+                "direction": "unclear",
+                "source": "semantic_guard",
+                "confidence": 1.0,
+                "is_invalid": False,
+                "reason": "Adjustment strength was stated without an upward or downward direction.",
+                "clarification_question": "높이를 유지할지, 올릴지, 내릴지 말씀해 주세요.",
+            }
+        )
+        return response
+
+    if control_type in ("LLM", "Rule"):
+        if llm_parser is None:
+            response.update(
+                {
+                    "is_invalid": True,
+                    "reason": f"{control_type} worker response requires an LLM parser.",
+                }
+            )
+            return response
+
         llm_start_time = time.time()
         llm_decision = llm_parser.parse(
             voice_text,
@@ -338,6 +384,7 @@ def parse_worker_adjustment_input(
         response.update(
             {
                 "action": llm_decision.action,
+                "direction": llm_decision.direction,
                 "target_shoulder_angle_deg": llm_decision.target_shoulder_angle_deg,
                 "latency": time.time() - llm_start_time,
                 "confidence": llm_decision.confidence,
@@ -347,7 +394,10 @@ def parse_worker_adjustment_input(
                 "clarification_question": llm_decision.clarification_question,
             }
         )
-        retry_reason = _llm_worker_retry_reason(voice_text, response)
+        if llm_decision.source == "llm_error":
+            return response
+
+        retry_reason = _llm_worker_retry_reason(voice_text, response, metadata)
         if retry_reason:
             response.update(
                 {
@@ -361,37 +411,16 @@ def parse_worker_adjustment_input(
             )
             return response
 
+        if control_type == "Rule":
+            return _apply_rule_worker_policy(response, metadata)
+
         response["answered"] = llm_decision.action in ("approve", "reject", "adjust")
         return response
 
-    raw_action = rule_parser.parse(voice_text, context="adjustment_response")
-    action = "adjust" if raw_action in ("adjust_up", "adjust_down") else raw_action
-    target_shoulder_angle_deg = (
-        _rule_target_shoulder_angle(
-            metadata,
-            direction=1.0 if raw_action == "adjust_up" else -1.0,
-        )
-        if raw_action in ("adjust_up", "adjust_down")
-        else None
-    )
-    if raw_action in ("adjust_up", "adjust_down") and target_shoulder_angle_deg is None:
-        action = "unknown"
-    clarification_question = (
-        "높이를 유지할지, 올릴지, 내릴지 말씀해 주세요."
-        if action == "ask_clarification"
-        else ""
-    )
-
     response.update(
         {
-            "answered": action in ("approve", "reject", "adjust"),
-            "action": action,
-            "target_shoulder_angle_deg": target_shoulder_angle_deg,
-            "source": "rule",
-            "reason": "matched rule keyword" if action != "unknown" else "no rule matched",
-            "confidence": 1.0 if action != "unknown" else 0.0,
-            "is_invalid": action == "unknown",
-            "clarification_question": clarification_question,
+            "is_invalid": True,
+            "reason": f"Unsupported worker control type: {control_type}",
         }
     )
     return response
@@ -406,18 +435,136 @@ def _manual_adjustment_action(key: int) -> str | None:
     return None
 
 
-def _rule_target_shoulder_angle(metadata: dict[str, Any] | None, direction: float) -> float | None:
+def resolve_rule_worker_target_angle_by_policy(
+    metadata: dict[str, Any] | None,
+    direction: str,
+) -> float | None:
+    if not isinstance(metadata, dict):
+        return None
+
+    try:
+        current_angle = float(metadata["current_robot_shoulder_angle_deg"])
+        effective_min = float(metadata["effective_min_shoulder_deg"])
+        up_step_deg = float(metadata.get("rule_worker_up_step_deg", RULE_WORKER_UP_STEP_DEG))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    if direction == "up":
+        return max(0.0, min(180.0, current_angle + up_step_deg))
+    if direction == "down":
+        if current_angle <= effective_min + RULE_MIN_ANGLE_TOLERANCE_DEG:
+            return None
+        return max(0.0, min(180.0, effective_min))
+    return None
+
+
+def _apply_rule_worker_policy(
+    response: dict[str, Any],
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    llm_action = str(response.get("action", "unknown"))
+    response["source"] = "rule_llm"
+
+    if llm_action == "reject":
+        response.update(
+            {
+                "answered": True,
+                "target_shoulder_angle_deg": None,
+                "reason": f"{response.get('reason', '')} Rule policy kept the current height.".strip(),
+            }
+        )
+        return response
+
+    direction = str(response.get("direction", "")).lower()
+    if direction not in ("up", "down"):
+        direction = _llm_adjustment_direction(response, metadata)
+    if llm_action not in ("approve", "adjust") or direction is None:
+        response.update(
+            {
+                "answered": False,
+                "action": "unknown",
+                "target_shoulder_angle_deg": None,
+                "is_invalid": True,
+                "reason": (
+                    f"{response.get('reason', '')} "
+                    "Rule policy could not determine an upward or downward direction."
+                ).strip(),
+            }
+        )
+        return response
+
+    target_angle = resolve_rule_worker_target_angle_by_policy(metadata, direction)
+    if direction == "down" and target_angle is None:
+        response.update(
+            {
+                "answered": False,
+                "action": "limit_reached",
+                "target_shoulder_angle_deg": None,
+                "is_invalid": False,
+                "reason": "Worker requested lowering at the robot's effective minimum height.",
+            }
+        )
+        return response
+
+    if target_angle is None:
+        response.update(
+            {
+                "answered": False,
+                "action": "unknown",
+                "target_shoulder_angle_deg": None,
+                "is_invalid": True,
+                "reason": "Rule policy could not calculate a target shoulder angle.",
+            }
+        )
+        return response
+
+    policy_reason = (
+        "Rule policy applied current shoulder angle +10 degrees."
+        if direction == "up"
+        else "Rule policy applied the worker-specific effective minimum shoulder angle."
+    )
+    response.update(
+        {
+            "answered": True,
+            "action": "adjust",
+            "target_shoulder_angle_deg": target_angle,
+            "is_invalid": False,
+            "reason": f"{response.get('reason', '')} {policy_reason}".strip(),
+        }
+    )
+    return response
+
+
+def _llm_adjustment_direction(
+    response: dict[str, Any],
+    metadata: dict[str, Any] | None,
+) -> str | None:
     if not isinstance(metadata, dict):
         return None
     try:
-        current_angle = float(metadata["cycle_representative_shoulder_angle_deg"])
-        step_deg = float(metadata.get("rule_shoulder_reduction_deg", 20.0))
+        current_angle = float(metadata["current_robot_shoulder_angle_deg"])
+        llm_target = float(response["target_shoulder_angle_deg"])
     except (KeyError, TypeError, ValueError):
         return None
-    return max(0.0, min(180.0, current_angle + direction * step_deg))
+
+    if llm_target > current_angle:
+        return "up"
+    if llm_target < current_angle:
+        return "down"
+    try:
+        effective_min = float(metadata["effective_min_shoulder_deg"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if current_angle <= effective_min + RULE_MIN_ANGLE_TOLERANCE_DEG:
+        return "down"
+    return None
 
 
-def _llm_worker_retry_reason(voice_text: str, response: dict[str, Any]) -> str:
+def _llm_worker_retry_reason(
+    voice_text: str,
+    response: dict[str, Any],
+    metadata: dict[str, Any] | None = None,
+) -> str:
     action = str(response.get("action", "unknown"))
     if action not in ("approve", "reject", "adjust"):
         return ""
@@ -436,6 +583,29 @@ def _llm_worker_retry_reason(voice_text: str, response: dict[str, Any]) -> str:
     if action in ("approve", "adjust") and response.get("target_shoulder_angle_deg") is None:
         return "LLM selected height adjustment without a target angle; asking worker to repeat."
 
+    if action in ("approve", "adjust"):
+        direction = str(response.get("direction", "")).lower()
+        if direction not in ("up", "down"):
+            return "LLM selected height adjustment without a clear direction."
+
+        try:
+            current_robot_angle = float((metadata or {})["current_robot_shoulder_angle_deg"])
+            target_angle = float(response["target_shoulder_angle_deg"])
+            effective_min = float((metadata or {})["effective_min_shoulder_deg"])
+            robot_max = float((metadata or {})["robot_max_reachable_shoulder_deg"])
+        except (KeyError, TypeError, ValueError):
+            return "Robot-relative shoulder-angle metadata is missing or invalid."
+
+        tolerance_deg = RULE_MIN_ANGLE_TOLERANCE_DEG
+        at_lower_limit = current_robot_angle <= effective_min + tolerance_deg
+        at_upper_limit = current_robot_angle >= robot_max - tolerance_deg
+        if direction == "up" and target_angle <= current_robot_angle:
+            if not (at_upper_limit and target_angle >= current_robot_angle - tolerance_deg):
+                return "Upward intent produced a non-upward target angle."
+        if direction == "down" and target_angle >= current_robot_angle:
+            if not (at_lower_limit and target_angle <= current_robot_angle + tolerance_deg):
+                return "Downward intent produced a non-downward target angle."
+
     normalized = _normalize(voice_text)
     if _is_directionless_confirmation(normalized):
         return "Directionless confirmation should be clarified before changing height."
@@ -451,6 +621,10 @@ def _llm_worker_retry_reason(voice_text: str, response: dict[str, Any]) -> str:
 
 def _is_directionless_confirmation(normalized: str) -> bool:
     return any(normalized == _normalize(phrase) for phrase in DIRECTIONLESS_CONFIRMATION_PHRASES)
+
+
+def _is_directionless_modifier(normalized: str) -> bool:
+    return any(normalized == _normalize(phrase) for phrase in DIRECTIONLESS_MODIFIER_PHRASES)
 
 
 def _is_directionless_adjustment_request(normalized: str) -> bool:
@@ -559,6 +733,7 @@ class LlmIntentParser:
         except Exception as exc:
             return LlmAdjustmentDecision(
                 raw_text=raw_text,
+                source="llm_error",
                 is_invalid=True,
                 reason=f"LLM intent parsing failed: {exc}",
             )
@@ -582,6 +757,7 @@ class LlmIntentParser:
         # LLM이 반환한 JSON dict에서 action과 목표 어깨각만 main에서 쓰기 쉽게 꺼낸다.
         return LlmAdjustmentDecision(
             action=str(parsed.get("action", "unknown")),
+            direction=str(parsed.get("direction", "unclear")).lower(),
             target_shoulder_angle_deg=LlmIntentParser._optional_float(
                 parsed.get("target_shoulder_angle_deg")
                 or parsed.get("target_angle_deg")
