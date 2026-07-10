@@ -40,6 +40,9 @@ LLM_ACTION_CONFIDENCE_THRESHOLD = 0.75
 RULE_WORKER_UP_STEP_DEG = 10.0
 RULE_WORKER_DOWN_STEP_DEG = 10.0
 RULE_MIN_ANGLE_TOLERANCE_DEG = 1.0
+LLM_SMALL_ADJUSTMENT_RANGE_DEG = (10.0, 20.0)
+LLM_NORMAL_ADJUSTMENT_RANGE_DEG = (20.0, 25.0)
+LLM_STRONG_ADJUSTMENT_RANGE_DEG = (25.0, 40.0)
 AMBIGUOUS_ASR_PHRASES = (
     "알겠",
     "알았",
@@ -118,6 +121,42 @@ DIRECTIONLESS_MODIFIER_PHRASES = (
     "조금만 해줘",
     "살짝 해줘",
     "약간 해줘",
+)
+SMALL_ADJUSTMENT_HINTS = (
+    "조금",
+    "조금만",
+    "살짝",
+    "약간",
+    "약간만",
+    "쪼금",
+)
+STRONG_ADJUSTMENT_HINTS = (
+    "확",
+    "팍",
+    "푹",
+    "훅",
+    "팝",
+    "많이",
+    "최대한",
+    "제일",
+    "끝까지",
+    "더",
+    "강하게",
+    "크게",
+    "엄청",
+)
+ADJUSTMENT_REQUEST_HINTS = (
+    "줘",
+    "주세요",
+    "줄래",
+    "달라",
+    "달라고",
+    "라고",
+    "라니까",
+    "해봐",
+    "하자",
+    "할게",
+    "겠습니다",
 )
 HEIGHT_POSTURE_HINTS = (
     "높이",
@@ -445,6 +484,13 @@ def parse_worker_adjustment_input(
         if response["action"] == "ask_clarification" and not response["clarification_question"]:
             response["clarification_question"] = "높이를 유지할지, 올릴지, 내릴지 말씀해 주세요."
 
+        _apply_worker_llm_policy_guard(
+            voice_text,
+            response,
+            metadata,
+            control_type,
+        )
+
         retry_reason = _llm_worker_retry_reason(
             voice_text,
             response,
@@ -467,7 +513,7 @@ def parse_worker_adjustment_input(
         if control_type == "Rule":
             return _apply_rule_worker_policy(response, metadata)
 
-        response["answered"] = llm_decision.action in ("approve", "reject", "adjust")
+        response["answered"] = response["action"] in ("approve", "reject", "adjust")
         return response
 
     response.update(
@@ -486,6 +532,175 @@ def _manual_adjustment_action(key: int) -> str | None:
     if key in (ord("n"), ord("N")):
         return "reject"
     return None
+
+
+def _apply_worker_llm_policy_guard(
+    voice_text: str,
+    response: dict[str, Any],
+    metadata: dict[str, Any] | None,
+    control_type: str,
+) -> None:
+    # LLM이 방향/강도 규칙을 흔들리게 반환하면 실험 정책 범위 안으로 보정한다.
+    if control_type not in ("LLM", "Rule"):
+        return
+
+    local_direction = _clear_adjustment_direction_from_text(voice_text)
+    action = str(response.get("action", "unknown"))
+    direction = str(response.get("direction", "unclear")).lower()
+
+    if action in ("ask_clarification", "unknown") and local_direction:
+        try:
+            confidence = float(response.get("confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        response.update(
+            {
+                "action": "adjust",
+                "direction": local_direction,
+                "is_invalid": False,
+                "clarification_question": "",
+                "confidence": max(confidence, 0.80),
+                "reason": _append_reason(
+                    str(response.get("reason", "")),
+                    "명확한 올림/내림 방향이 있어 강도 표현을 조정 의도로 해석했습니다.",
+                ),
+            }
+        )
+        action = "adjust"
+        direction = local_direction
+    elif action == "adjust" and direction not in ("up", "down") and local_direction:
+        response["direction"] = local_direction
+        direction = local_direction
+
+    if control_type != "LLM" or action != "adjust" or direction not in ("up", "down"):
+        return
+
+    target_range = _llm_worker_allowed_target_range(voice_text, metadata, direction)
+    if target_range is None:
+        return
+
+    lower, upper, default_target, strength = target_range
+    try:
+        target = float(response["target_shoulder_angle_deg"])
+        target_missing = False
+    except (KeyError, TypeError, ValueError):
+        target = default_target
+        target_missing = True
+
+    target_out_of_range = target < lower or target > upper
+    guarded_target = default_target if target_missing or target_out_of_range else target
+    guarded_target = max(lower, min(upper, guarded_target))
+    if target_missing or target_out_of_range:
+        response["target_shoulder_angle_deg"] = guarded_target
+        response["reason"] = _append_reason(
+            str(response.get("reason", "")),
+            f"Worker+LLM {strength} {direction} 범위로 목표각을 보정했습니다.",
+        )
+
+
+def _llm_worker_allowed_target_range(
+    voice_text: str,
+    metadata: dict[str, Any] | None,
+    direction: str,
+) -> tuple[float, float, float, str] | None:
+    if not isinstance(metadata, dict):
+        return None
+
+    try:
+        current_angle = float(metadata["cycle_representative_shoulder_angle_deg"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    strength = _adjustment_strength_from_text(voice_text)
+
+    if direction == "down" and bool(metadata.get("cycle_is_risky", False)):
+        try:
+            effective_min = float(metadata["effective_min_shoulder_deg"])
+            safe_max = float(metadata.get("pilot_functional_max_shoulder_deg", 80.0))
+        except (KeyError, TypeError, ValueError):
+            return None
+        lower = min(effective_min, safe_max)
+        upper = max(effective_min, safe_max)
+        if strength == "small":
+            default_target = upper
+        elif strength == "strong":
+            default_target = lower
+        else:
+            default_target = (lower + upper) / 2.0
+        return lower, upper, default_target, strength
+
+    min_step, max_step, default_step = _step_range_for_strength(strength)
+    if direction == "up":
+        return (
+            current_angle + min_step,
+            current_angle + max_step,
+            current_angle + default_step,
+            strength,
+        )
+    if direction == "down":
+        return (
+            current_angle - max_step,
+            current_angle - min_step,
+            current_angle - default_step,
+            strength,
+        )
+    return None
+
+
+def _adjustment_strength_from_text(voice_text: str) -> str:
+    normalized = _normalize(voice_text)
+    if _has_any(normalized, SMALL_ADJUSTMENT_HINTS):
+        return "small"
+    if _has_any(normalized, STRONG_ADJUSTMENT_HINTS):
+        return "strong"
+    return "normal"
+
+
+def _step_range_for_strength(strength: str) -> tuple[float, float, float]:
+    if strength == "small":
+        min_step, max_step = LLM_SMALL_ADJUSTMENT_RANGE_DEG
+    elif strength == "strong":
+        min_step, max_step = LLM_STRONG_ADJUSTMENT_RANGE_DEG
+    else:
+        min_step, max_step = LLM_NORMAL_ADJUSTMENT_RANGE_DEG
+    return min_step, max_step, (min_step + max_step) / 2.0
+
+
+def _clear_adjustment_direction_from_text(voice_text: str) -> str | None:
+    normalized = _normalize(voice_text)
+    if not normalized:
+        return None
+
+    request_like = _has_any(normalized, ADJUSTMENT_REQUEST_HINTS)
+    direction_ending = any(
+        normalized.endswith(_normalize(keyword))
+        for keyword in (*UPWARD_ADJUST_KEYWORDS, *DOWNWARD_ADJUST_KEYWORDS)
+    )
+    if not request_like and not direction_ending:
+        return None
+
+    matches: list[tuple[int, str]] = []
+    for keyword in UPWARD_ADJUST_KEYWORDS:
+        idx = normalized.rfind(_normalize(keyword))
+        if idx >= 0:
+            matches.append((idx, "up"))
+    for keyword in DOWNWARD_ADJUST_KEYWORDS:
+        idx = normalized.rfind(_normalize(keyword))
+        if idx >= 0:
+            matches.append((idx, "down"))
+
+    if not matches:
+        return None
+    return max(matches, key=lambda item: item[0])[1]
+
+
+def _append_reason(existing: str, extra: str) -> str:
+    existing = existing.strip()
+    if not existing:
+        return extra
+    if extra in existing:
+        return existing
+    return f"{existing} {extra}"
 
 
 def resolve_rule_worker_target_angle_by_policy(
