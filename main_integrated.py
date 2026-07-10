@@ -33,8 +33,9 @@ INITIAL_SHOULDER_ANGLE_DEG = 130.0
 MAX_EXPERIMENT_TIME_SEC = 480.0
 PILOT_FUNCTIONAL_MIN_SHOULDER_DEG = 60.0
 PILOT_FUNCTIONAL_MAX_SHOULDER_DEG = 80.0
-RULE_WORKER_UP_STEP_DEG = 10.0
-RULE_WORKER_DOWN_STEP_DEG = 10.0
+LLM_DEFAULT_SAFE_TARGET_DEG = 70.0
+LLM_SAFE_TARGET_UPPER_BUFFER_DEG = 3.0
+RULE_Z_STEP_MM = 50.0
 ROBOT_STATE_POLL_SEC = 0.2
 RISK_SHOULDER_DEG = 110.0
 RISKY_CYCLE_RATIO_THRESHOLD = 0.60
@@ -214,6 +215,34 @@ def main():
         robot_max_shoulder_deg,
         max(effective_min_shoulder_deg, PILOT_FUNCTIONAL_MAX_SHOULDER_DEG),
     )
+
+    def clamp_llm_safe_angle(target_angle_deg: float) -> float:
+        lower = effective_min_shoulder_deg
+        upper = safe_range_upper_shoulder_deg
+        if lower > upper:
+            return lower
+        return max(lower, min(upper, float(target_angle_deg)))
+
+    def default_llm_safe_target_angle() -> float:
+        if effective_min_shoulder_deg > LLM_DEFAULT_SAFE_TARGET_DEG + LLM_SAFE_TARGET_UPPER_BUFFER_DEG:
+            return effective_min_shoulder_deg
+        return clamp_llm_safe_angle(LLM_DEFAULT_SAFE_TARGET_DEG)
+
+    def current_rule_step_floor_height_m(direction: str) -> float:
+        step_m = RULE_Z_STEP_MM / 1000.0
+        current_floor_height_m = current_tighten_z_mm / 1000.0
+        if direction == "up":
+            return current_floor_height_m + step_m
+        if direction == "down":
+            return current_floor_height_m - step_m
+        return current_floor_height_m
+
+    def is_policy_risky_cycle(cycle) -> bool:
+        return (
+            bool(cycle.is_risky_cycle)
+            or cycle.representative_shoulder_angle_deg >= RISK_SHOULDER_DEG
+        )
+
     print(
         "[RULE 높이 정책] "
         f"로봇 최저 도달 어깨각={robot_min_shoulder_deg:.2f}도 | "
@@ -300,7 +329,8 @@ def main():
             "cycle_task_time_sec": cycle.task_time_s,
             "cycle_risky_time_sec": cycle.risky_time_s,
             "cycle_risky_ratio": cycle.risky_ratio,
-            "cycle_is_risky": cycle.is_risky_cycle,
+            "cycle_is_risky": is_policy_risky_cycle(cycle),
+            "cycle_ratio_is_risky": cycle.is_risky_cycle,
             "cycle_representative_shoulder_angle_deg": cycle.representative_shoulder_angle_deg,
             "cycle_avg_elbow_angle_deg": cycle.avg_elbow_angle_deg,
             "cycle_avg_rula_proxy_score": cycle.avg_rula_proxy,
@@ -313,8 +343,8 @@ def main():
             "robot_max_reachable_shoulder_deg": robot_max_shoulder_deg,
             "effective_min_shoulder_deg": effective_min_shoulder_deg,
             "current_robot_shoulder_angle_deg": current_robot_shoulder_deg,
-            "rule_worker_up_step_deg": RULE_WORKER_UP_STEP_DEG,
-            "rule_worker_down_step_deg": RULE_WORKER_DOWN_STEP_DEG,
+            "llm_default_safe_target_deg": default_llm_safe_target_angle(),
+            "rule_z_step_mm": RULE_Z_STEP_MM,
             "robot_min_floor_height_m": pose_generator.min_floor_height_m,
             "risk_trigger_deg": RISK_SHOULDER_DEG,
             "user_shoulder_height_mm": user_shoulder_height_cm * 10,
@@ -345,31 +375,73 @@ def main():
             "robot_max_reachable_shoulder_deg": metadata[
                 "robot_max_reachable_shoulder_deg"
             ],
+            "llm_default_safe_target_deg": metadata["llm_default_safe_target_deg"],
         }
 
     def worker_target_limit_message(direction, target_shoulder_angle_deg):
-        if target_shoulder_angle_deg is None:
-            return None
-
-        preview = pose_generator.generate_pose_from_shoulder_angle(
-            float(target_shoulder_angle_deg),
-            human_profile,
-        )
         current_floor_height_m = current_tighten_z_mm / 1000.0
-        if abs(preview.target_floor_height_m - current_floor_height_m) > 1e-6:
-            return None
+
+        if target_shoulder_angle_deg is not None:
+            preview = pose_generator.generate_pose_from_shoulder_angle(
+                float(target_shoulder_angle_deg),
+                human_profile,
+            )
+            if abs(preview.target_floor_height_m - current_floor_height_m) > 1e-6:
+                return None
 
         if direction == "down" and current_floor_height_m <= pose_generator.min_floor_height_m + 1e-6:
             return (
                 "현재 로봇이 전달할 수 있는 최저 높이입니다. "
-                "더 낮춰서 전달할 수 없습니다."
+                "더 낮춰서 전달할 수 없습니다. 다시 말씀해 주세요."
             )
         if direction == "up" and current_floor_height_m >= pose_generator.max_floor_height_m - 1e-6:
             return (
                 "현재 로봇이 전달할 수 있는 최고 높이입니다. "
-                "더 높여서 전달할 수 없습니다."
+                "더 높여서 전달할 수 없습니다. 다시 말씀해 주세요."
             )
         return None
+
+    def worker_adjustment_ack_message(worker_response):
+        if current_condition["lead"] != "Worker":
+            return None
+        if worker_response.get("action") not in ("approve", "adjust"):
+            return None
+
+        direction = str(worker_response.get("direction", "")).lower()
+        if direction not in ("up", "down"):
+            return None
+
+        if (
+            current_condition["control"] == "LLM"
+            and current_cycle_result is not None
+            and is_policy_risky_cycle(current_cycle_result)
+        ):
+            return "네, 안전 각도로 조정하겠습니다."
+
+        strength = worker_adjustment_strength_from_text(worker_response.get("text", ""))
+        if direction == "up":
+            if strength == "small":
+                return "네, 조금 올리겠습니다."
+            if strength == "strong":
+                return "네, 강하게 올리겠습니다."
+            return "네, 올리겠습니다."
+
+        if strength == "small":
+            return "네, 조금 내리겠습니다."
+        if strength == "strong":
+            return "네, 강하게 내리겠습니다."
+        return "네, 내리겠습니다."
+
+    def worker_adjustment_strength_from_text(text):
+        normalized = str(text or "").lower().replace(" ", "")
+        if any(keyword in normalized for keyword in ("조금", "조금만", "살짝", "약간", "쪼금")):
+            return "small"
+        if any(
+            keyword in normalized
+            for keyword in ("확", "많이", "강하게", "크게", "최대한", "제일", "끝까지")
+        ):
+            return "strong"
+        return "normal"
 
     def apply_next_target(
         user_response_text,
@@ -402,54 +474,56 @@ def main():
             user_response_text = f"Task completed; risky time {cycle.risky_time_s:.2f}s"
 
         if should_adjust:
-            if target_shoulder_angle_deg is None:
-                raise ValueError("높이 조정에는 명시적인 목표 어깨각이 필요합니다.")
-
-            rule_safe_guidance_required = (
-                response_source in ("system_rule", "system_rule_fallback")
-                or (
-                    response_source == "rule_llm"
-                    and cycle.is_risky_cycle
-                    and response_direction == "down"
+            is_rule_z_step = response_source in ("system_rule", "rule_llm")
+            if is_rule_z_step:
+                target_floor_height_m = current_rule_step_floor_height_m(response_direction)
+                pose_result = pose_generator.generate_pose_from_floor_height(
+                    target_floor_height_m,
+                    human_profile,
                 )
-            )
-            target_lower_bound = (
-                effective_min_shoulder_deg
-                if rule_safe_guidance_required
-                else robot_min_shoulder_deg
-            )
-            target_upper_bound = (
-                safe_range_upper_shoulder_deg
-                if rule_safe_guidance_required
-                else robot_max_shoulder_deg
-            )
-            target_angle_deg = max(
-                target_lower_bound,
-                min(target_upper_bound, float(target_shoulder_angle_deg)),
-            )
-            print(
-                "[최종 목표각] "
-                f"proposed={float(target_shoulder_angle_deg):.2f}도 | "
-                f"final={target_angle_deg:.2f}도 | "
-                f"allowed={target_lower_bound:.2f}~{target_upper_bound:.2f}도"
-            )
-            if response_source == "rule_llm":
-                if response_direction == "up":
-                    target_angle_source = "rule_current_plus_10deg"
-                elif cycle.is_risky_cycle:
-                    target_angle_source = "rule_safe_range_upper"
+                target_angle_deg = shoulder_angle_from_floor_height_deg(
+                    shoulder_height_m=human_profile.shoulder_height_m,
+                    total_arm_length_m=human_profile.total_arm_length_m,
+                    floor_height_m=pose_result.target_floor_height_m,
+                )
+                angle_adjustment_deg = target_angle_deg - cycle.representative_shoulder_angle_deg
+                if response_source == "system_rule" or response_direction == "down":
+                    target_angle_source = "rule_z_minus_50mm"
+                elif response_direction == "up":
+                    target_angle_source = "rule_z_plus_50mm"
                 else:
-                    target_angle_source = "rule_current_minus_10deg"
-            elif response_source in ("system_rule", "system_rule_fallback"):
-                target_angle_source = "rule_safe_range_upper"
+                    target_angle_source = "rule_z_step_50mm"
+                print(
+                    "[Rule z-step] "
+                    f"direction={response_direction} | "
+                    f"prev_z={previous_target_z_mm:.1f}mm | "
+                    f"target_z={pose_result.target_floor_height_m * 1000.0:.1f}mm | "
+                    f"equiv_angle={target_angle_deg:.2f}도"
+                )
             else:
-                target_angle_source = "llm"
+                if target_shoulder_angle_deg is None:
+                    raise ValueError("높이 조정에는 명시적인 목표 어깨각이 필요합니다.")
 
-            angle_adjustment_deg = target_angle_deg - cycle.representative_shoulder_angle_deg
-            pose_result = pose_generator.generate_pose_from_shoulder_angle(
-                target_angle_deg,
-                human_profile,
-            )
+                proposed_target_angle = float(target_shoulder_angle_deg)
+                target_angle_deg = clamp_llm_safe_angle(proposed_target_angle)
+                print(
+                    "[LLM 안전 목표각] "
+                    f"proposed={proposed_target_angle:.2f}도 | "
+                    f"final={target_angle_deg:.2f}도 | "
+                    f"allowed={effective_min_shoulder_deg:.2f}~{safe_range_upper_shoulder_deg:.2f}도"
+                )
+                if response_source == "system_llm_fallback":
+                    target_angle_source = "llm_safe_70deg_fallback"
+                elif current_condition["lead"] == "System" and current_condition["control"] == "LLM":
+                    target_angle_source = "llm_safe_70deg"
+                else:
+                    target_angle_source = "llm_safe_range"
+
+                angle_adjustment_deg = target_angle_deg - cycle.representative_shoulder_angle_deg
+                pose_result = pose_generator.generate_pose_from_shoulder_angle(
+                    target_angle_deg,
+                    human_profile,
+                )
             is_approved = True
         else:
             # 조정하지 않는 경우에는 현재 pass 높이를 그대로 pose로 다시 만든다.
@@ -682,7 +756,7 @@ def main():
         if entered_returning and completion_sent:
             SetReviewPending(True)
             user_response_text = ""
-            policy = decide_returning_policy(current_condition, current_cycle_result.is_risky_cycle)
+            policy = decide_returning_policy(current_condition, is_policy_risky_cycle(current_cycle_result))
             speak(policy["message"])
             if policy["mode"] == "ask_worker":
                 tts_speaker.wait_until_done()
@@ -719,7 +793,7 @@ def main():
                         apply_next_target(
                             "[System+LLM] automatic adjustment",
                             True,
-                            target_shoulder_angle_deg=llm_decision.target_shoulder_angle_deg,
+                            target_shoulder_angle_deg=default_llm_safe_target_angle(),
                             llm_latency=llm_latency,
                             is_invalid=llm_decision.is_invalid,
                             response_action=llm_decision.action,
@@ -730,33 +804,31 @@ def main():
                         )
                     else:
                         apply_next_target(
-                            "[System+LLM fallback] rule adjustment",
+                            "[System+LLM fallback] safe-angle adjustment",
                             policy["should_adjust"],
-                            target_shoulder_angle_deg=safe_range_upper_shoulder_deg,
+                            target_shoulder_angle_deg=default_llm_safe_target_angle(),
                             llm_latency=llm_latency,
                             is_invalid=llm_decision.is_invalid,
                             response_action=llm_decision.action,
-                            response_source="system_rule_fallback",
+                            response_source="system_llm_fallback",
                             response_direction="down",
                             llm_confidence=llm_decision.confidence,
                             decision_reason=llm_decision.reason,
                             llm_fallback=True,
                         )
                 else:
-                    system_rule_target = (
-                        safe_range_upper_shoulder_deg
-                        if policy["should_adjust"]
+                    is_system_rule_adjustment = (
+                        policy["should_adjust"]
                         and current_condition["lead"] == "System"
                         and current_condition["control"] == "Rule"
-                        else None
                     )
                     apply_next_target(
                         user_response_text,
                         policy["should_adjust"],
-                        target_shoulder_angle_deg=system_rule_target,
+                        target_shoulder_angle_deg=None,
                         response_action="adjust" if policy["should_adjust"] else "maintain",
-                        response_source="system_rule" if system_rule_target is not None else "policy",
-                        response_direction="down" if system_rule_target is not None else "maintain",
+                        response_source="system_rule" if is_system_rule_adjustment else "policy",
+                        response_direction="down" if is_system_rule_adjustment else "maintain",
                     )
             else:
                 speech_recognizer.get_and_clear()
@@ -808,7 +880,7 @@ def main():
             if worker_response["action"] == "limit_reached":
                 speak_and_wait(
                     "현재 로봇이 전달할 수 있는 최저 높이입니다. "
-                    "더 낮춰서 전달할 수 없습니다."
+                    "더 낮춰서 전달할 수 없습니다. 다시 말씀해 주세요."
                 )
                 speech_recognizer.get_and_clear()
                 print("[최저 높이 도달] 작업자 답변을 계속 기다립니다.")
@@ -827,6 +899,9 @@ def main():
                     speech_recognizer.get_and_clear()
                     print("[로봇 높이 한계 도달] 작업자 답변을 계속 기다립니다.")
                 else:
+                    ack_message = worker_adjustment_ack_message(worker_response)
+                    if ack_message:
+                        speak_and_wait(ack_message)
                     apply_next_target(
                         worker_response["text"],
                         should_adjust,

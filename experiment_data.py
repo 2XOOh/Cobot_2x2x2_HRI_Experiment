@@ -30,6 +30,7 @@ class CycleResult:
     visibility_ok_time_s: float
     visibility_ok_ratio: float
     representative_shoulder_angle_deg: float
+    avg_shoulder_angle_deg: float
     avg_elbow_angle_deg: float
     avg_rula_proxy: float
     max_rula_proxy: float
@@ -104,6 +105,7 @@ class SummaryRecord:
     llm_fallback_count: int
     avg_llm_latency_s: float
     avg_representative_shoulder_angle_deg: float
+    avg_shoulder_angle_deg: float
     avg_rula_proxy: float
     risk_shoulder_threshold_deg: float
     risky_cycle_ratio_threshold: float
@@ -145,6 +147,7 @@ class ExperimentMetrics:
         self.llm_latencies: list[float] = []
         self.cycle_durations: list[float] = []
         self.cycle_representative_shoulder_angles: list[float] = []
+        self.cycle_avg_shoulder_angles: list[float] = []
         self.cycle_avg_rula_scores: list[float] = []
 
         self.start_cycle()
@@ -154,6 +157,7 @@ class ExperimentMetrics:
         self.cycle_task_time_s = 0.0
         self.cycle_risky_time_s = 0.0
         self.cycle_shoulder_angles: list[float] = []
+        self.cycle_shoulder_weighted_sum = 0.0
         self.cycle_elbow_weighted_sum = 0.0
         self.cycle_rula_weighted_sum = 0.0
         self.cycle_max_rula = 1.0
@@ -174,6 +178,7 @@ class ExperimentMetrics:
 
         self.cycle_visibility_ok_time_s += dt
         self.cycle_shoulder_angles.append(float(posture.shoulder_angle_deg))
+        self.cycle_shoulder_weighted_sum += posture.shoulder_angle_deg * dt
         self.cycle_elbow_weighted_sum += posture.elbow_angle_deg * dt
         self.cycle_rula_weighted_sum += posture.rula_proxy * dt
         self.cycle_max_rula = max(self.cycle_max_rula, float(posture.rula_proxy))
@@ -200,6 +205,7 @@ class ExperimentMetrics:
             visibility_ok_time_s=self.cycle_visibility_ok_time_s,
             visibility_ok_ratio=max(0.0, min(1.0, visibility_ratio)),
             representative_shoulder_angle_deg=representative_shoulder_angle,
+            avg_shoulder_angle_deg=self.cycle_shoulder_weighted_sum / visible_time if visible_time > 0 else 0.0,
             avg_elbow_angle_deg=self.cycle_elbow_weighted_sum / visible_time if visible_time > 0 else 80.0,
             avg_rula_proxy=self.cycle_rula_weighted_sum / visible_time if visible_time > 0 else 1.0,
             max_rula_proxy=self.cycle_max_rula,
@@ -218,6 +224,7 @@ class ExperimentMetrics:
         self.risky_posture_time_s += cycle.risky_time_s
         self.cycle_durations.append(cycle.task_time_s)
         self.cycle_representative_shoulder_angles.append(cycle.representative_shoulder_angle_deg)
+        self.cycle_avg_shoulder_angles.append(cycle.avg_shoulder_angle_deg)
         self.cycle_avg_rula_scores.append(cycle.avg_rula_proxy)
 
         if cycle.is_risky_cycle:
@@ -275,6 +282,11 @@ class ExperimentMetrics:
             if self.cycle_representative_shoulder_angles
             else 0.0
         )
+        avg_shoulder = (
+            sum(self.cycle_avg_shoulder_angles) / len(self.cycle_avg_shoulder_angles)
+            if self.cycle_avg_shoulder_angles
+            else 0.0
+        )
         avg_rula = (
             sum(self.cycle_avg_rula_scores) / len(self.cycle_avg_rula_scores)
             if self.cycle_avg_rula_scores
@@ -301,6 +313,7 @@ class ExperimentMetrics:
             llm_fallback_count=self.llm_fallback_count,
             avg_llm_latency_s=avg_llm_latency,
             avg_representative_shoulder_angle_deg=avg_representative_shoulder,
+            avg_shoulder_angle_deg=avg_shoulder,
             avg_rula_proxy=avg_rula,
             risk_shoulder_threshold_deg=self.risk_shoulder_deg,
             risky_cycle_ratio_threshold=self.risky_cycle_ratio_threshold,
@@ -327,7 +340,7 @@ class ExperimentDataLogger:
         # cycle 자세 결과
         "Task_Time_s", "Risky_Time_s", "Risky_Ratio", "Is_Risky_Cycle",
         "Visibility_OK_Time_s", "Visibility_OK_Ratio",
-        "Representative_Shoulder_Angle_deg", "Avg_Elbow_Angle_deg",
+        "Representative_Shoulder_Angle_deg", "Avg_Shoulder_Angle_deg", "Avg_Elbow_Angle_deg",
         "Avg_RULA_Proxy", "Max_RULA_Proxy", "RULA_High_Ratio",
         # 의사결정 결과
         "Target_Shoulder_Angle_deg", "Angle_Adjustment_deg", "Target_Angle_Source",
@@ -352,7 +365,7 @@ class ExperimentDataLogger:
         "Worker_Approve_Count", "Worker_Reject_Count",
         "LLM_Call_Count", "LLM_Fallback_Count", "Avg_LLM_Latency_s",
         # 자세 요약
-        "Avg_Representative_Shoulder_Angle_deg", "Avg_RULA_Proxy",
+        "Avg_Representative_Shoulder_Angle_deg", "Avg_Shoulder_Angle_deg", "Avg_RULA_Proxy",
         # 분석 기준값과 피험자 치수
         "Risk_Shoulder_Threshold_deg", "Risky_Cycle_Ratio_Threshold",
         "User_Height_cm", "Shoulder_Height_cm", "Upper_Arm_cm", "Forearm_cm", "Drill_TCP_Offset_cm",
@@ -418,6 +431,7 @@ class ExperimentDataLogger:
             _round(cycle.visibility_ok_time_s, 2),
             _round(cycle.visibility_ok_ratio, 3),
             _round(cycle.representative_shoulder_angle_deg, 2),
+            _round(cycle.avg_shoulder_angle_deg, 2),
             _round(cycle.avg_elbow_angle_deg, 2),
             _round(cycle.avg_rula_proxy, 2),
             _round(cycle.max_rula_proxy, 2),
@@ -470,6 +484,7 @@ class ExperimentDataLogger:
             record.llm_fallback_count,
             _round(record.avg_llm_latency_s, 2),
             _round(record.avg_representative_shoulder_angle_deg, 2),
+            _round(record.avg_shoulder_angle_deg, 2),
             _round(record.avg_rula_proxy, 2),
             record.risk_shoulder_threshold_deg,
             record.risky_cycle_ratio_threshold,
@@ -481,7 +496,7 @@ class ExperimentDataLogger:
             record.early_stop_flag,
         ]
 
-def _mode_angle_by_bin(angles: list[float], bin_size_deg: float = 5.0, default: float = 0.0) -> float:
+def _mode_angle_by_bin(angles: list[float], bin_size_deg: float = 2.0, default: float = 0.0) -> float:
     """5도 단위로 묶어 가장 오래 머문 어깨각 구간의 대표값을 계산한다."""
     if not angles:
         return default

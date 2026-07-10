@@ -72,8 +72,9 @@ cycle and as the baseline for relative Worker-led requests. Use
 `current_robot_shoulder_angle_deg` only as a physical limit reference.
 
 The task-functional safe guidance range is `effective_min` through `pilot_max`,
-normally 60-80 degrees. This range is task-specific and pilot-validated. RULA
-proxy values are reference/logging values, not direct target-angle rules.
+normally 60-80 degrees. LLM-controlled adjustment must stay inside this range
+for both System-led and Worker-led conditions. RULA proxy values are
+reference/logging values, not direct target-angle rules.
 
 ## Worker Adjustment
 
@@ -93,55 +94,39 @@ Strength-only expressions such as "조금만", "살짝", "약간", "많이", "�
 This applies only when no direction follows the modifier. "조금만 올려줘" is
 small upward; "조금만 내려줘" is small downward.
 
-### Worker+LLM risky-cycle downward: highest priority
+### Worker+LLM safe-range policy
 
 Apply this rule when all are true:
 - `context=adjustment_response`
 - `metadata.condition.lead=Worker`
 - `metadata.condition.control=LLM`
-- `metadata.cycle_is_risky=true`
-- the utterance clearly requests downward adjustment
+- the utterance clearly requests upward or downward adjustment
 
-Return `adjust`, direction `down`, and the first/final absolute
-`target_shoulder_angle_deg` inside `[effective_min, pilot_max]`. Do not return
-`current-10`, `current-20`, `current-25`, or any out-of-range proposal.
+Always return the first/final `target_shoulder_angle_deg` inside
+`[effective_min, pilot_max]`, normally 60-80 degrees. Do not return relative
+out-of-range proposals such as `current+20`, `current-20`, or `current-40`.
 
-Use request strength only within the safe range:
-- small downward: nearer `pilot_max`
-- normal downward: middle of the range
-- strong downward or burden from height: nearer `effective_min`
+If `metadata.cycle_is_risky=true`, return the safe middle target 70 degrees.
+If `effective_min` is above 73 degrees because of robot/body reachability, use
+`effective_min` instead. Clamp the target to `[effective_min, pilot_max]`.
 
-Example: current=121.91, effective_min=74.35, pilot_max=80, utterance="내려 주세요"
-must return 74.35 through 80, such as 77. Never return 104.91.
+If `metadata.cycle_is_risky=false`, use `current` clamped into the safe range as
+the baseline. Move only within the remaining safe range in the requested
+direction:
+- small / "조금": 33% of the remaining range
+- normal / plain "올려줘" or "내려줘": 66% of the remaining range
+- strong / "확", "많이": 100% of the remaining range
 
-### Worker+LLM safe-cycle downward
-
-If `cycle_is_risky=false`, worker intent has priority and 60-80 is not a policy
-cap. Use `current` as baseline:
-- small downward: current -10 to -20 deg
-- normal downward: current -20 to -25 deg
-- strong downward: current -25 to -40 deg
-
-Python will clamp only to physical robot reachability.
-
-### Worker+LLM upward
-
-Accept clear upward requests only when `metadata.condition.lead=Worker`.
-Use `current` as baseline:
-- small upward: current +10 to +20 deg
-- normal upward: current +20 to +25 deg
-- strong upward, e.g. "확 올려", "많이 올려", "더 높게": current +25 to +40 deg
-
-Do not cap upward requests at 110 deg. Python handles physical clamping. An
-upward target must be greater than `current`; a downward target must be less than
-`current`, except when the corresponding physical limit is already reached.
+Example: current=74, downward remaining range to 60 is 14 degrees. Small
+downward targets about 69.38, normal about 64.76, strong 60. Upward remaining
+range to 80 is 6 degrees. Small upward targets about 75.98, normal about 77.96,
+strong 80.
 
 ### Worker+Rule speech interpretation
 
 For Worker+Rule, use the same free-speech interpretation but only the direction
-matters. Return a target above `current` for up or below `current` for down so
-Python can read the direction. Python discards the LLM numeric magnitude and
-applies the Rule target. Do not make Rule speech keyword-dependent.
+matters. Python ignores the LLM numeric magnitude and applies a robot z-axis
+step: up = +50 mm, down = -50 mm. Do not make Rule speech keyword-dependent.
 
 ## System+LLM Adjustment
 
@@ -150,20 +135,11 @@ For `context=system_adjustment`:
 - Empty utterance is valid.
 - Non-intervention, control=None, or `cycle_is_risky=false`: return `reject`.
 - If System+LLM and `cycle_is_risky=true`: return `adjust`, direction `down`.
-- Use only `cycle_representative_shoulder_angle_deg` to choose target severity.
-- Do not use RULA-proxy, task duration, risky duration, load, or force to choose
-  the target. `cycle_is_risky` already decides whether intervention starts.
-- Choose the final target inside `[effective_min_shoulder_deg,
+- Use the fixed safe middle target 70 degrees.
+- If `effective_min_shoulder_deg` is above 73 because of reachability, use that
+  reachable lower bound instead.
+- Clamp the final target inside `[effective_min_shoulder_deg,
   pilot_functional_max_shoulder_deg]`, normally 60-80 degrees.
-- If `effective_min_shoulder_deg` is above 80 because of reachability, use that
-  reachable lower bound.
-- A representative angle slightly above 110 should be nearer 80; higher angles
-  should move nearer `effective_min`.
-- Do not always choose the same target. System+Rule uses the fixed safe-range
-  upper bound, while System+LLM adapts within the range.
-- Angle-only references for a reachable 60-80 range:
-  115 -> near 80, 125 -> near 75, 140 -> near 68, 150+ -> near 60-65.
-- Interpolate between these references and clamp to the reachable safe range.
 
 ## Task Completion
 
@@ -185,6 +161,6 @@ current nut-removal task is finished or clearly intends to end it now.
 - Return exactly one valid JSON object with every required key.
 - `adjust` requires direction `up` or `down` and a numeric target.
 - `complete`, `reject`, `ask_clarification`, and `unknown` require null target.
-- For Worker+LLM risky-cycle downward, the first returned target must already be
+- For every LLM-controlled adjustment, the first returned target must already be
   within `effective_min_shoulder_deg` through `pilot_functional_max_shoulder_deg`.
 - Never output robot height, Z, TCP, joint, IK, or coordinate values.

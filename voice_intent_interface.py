@@ -37,12 +37,12 @@ REJECT_KEYWORDS = ("아니", "아니요", "괜찮", "그대로", "하지마", "�
 UPWARD_ADJUST_KEYWORDS = ("올려", "올리", "높여", "위로", "높게")
 DOWNWARD_ADJUST_KEYWORDS = ("낮춰", "낮추", "내려", "내리", "아래로", "낮게")
 LLM_ACTION_CONFIDENCE_THRESHOLD = 0.75
-RULE_WORKER_UP_STEP_DEG = 10.0
-RULE_WORKER_DOWN_STEP_DEG = 10.0
 RULE_MIN_ANGLE_TOLERANCE_DEG = 1.0
-LLM_SMALL_ADJUSTMENT_RANGE_DEG = (10.0, 20.0)
-LLM_NORMAL_ADJUSTMENT_RANGE_DEG = (20.0, 25.0)
-LLM_STRONG_ADJUSTMENT_RANGE_DEG = (25.0, 40.0)
+LLM_DEFAULT_SAFE_TARGET_DEG = 70.0
+LLM_SAFE_TARGET_UPPER_BUFFER_DEG = 3.0
+LLM_SMALL_ADJUSTMENT_RATIO = 0.33
+LLM_NORMAL_ADJUSTMENT_RATIO = 0.66
+LLM_STRONG_ADJUSTMENT_RATIO = 1.0
 AMBIGUOUS_ASR_PHRASES = (
     "알겠",
     "알았",
@@ -580,21 +580,20 @@ def _apply_worker_llm_policy_guard(
         return
 
     lower, upper, default_target, strength = target_range
+    guarded_target = max(lower, min(upper, default_target))
     try:
         target = float(response["target_shoulder_angle_deg"])
         target_missing = False
     except (KeyError, TypeError, ValueError):
-        target = default_target
+        target = guarded_target
         target_missing = True
 
-    target_out_of_range = target < lower or target > upper
-    guarded_target = default_target if target_missing or target_out_of_range else target
-    guarded_target = max(lower, min(upper, guarded_target))
-    if target_missing or target_out_of_range:
+    target_out_of_policy = abs(target - guarded_target) > 1e-6
+    if target_missing or target_out_of_policy:
         response["target_shoulder_angle_deg"] = guarded_target
         response["reason"] = _append_reason(
             str(response.get("reason", "")),
-            f"Worker+LLM {strength} {direction} 범위로 목표각을 보정했습니다.",
+            f"Worker+LLM {strength} {direction} safe-range policy applied.",
         )
 
 
@@ -611,40 +610,50 @@ def _llm_worker_allowed_target_range(
     except (KeyError, TypeError, ValueError):
         return None
 
+    bounds = _llm_safe_target_bounds(metadata)
+    if bounds is None:
+        return None
+    lower, upper = bounds
     strength = _adjustment_strength_from_text(voice_text)
 
-    if direction == "down" and bool(metadata.get("cycle_is_risky", False)):
-        try:
-            effective_min = float(metadata["effective_min_shoulder_deg"])
-            safe_max = float(metadata.get("pilot_functional_max_shoulder_deg", 80.0))
-        except (KeyError, TypeError, ValueError):
-            return None
-        lower = min(effective_min, safe_max)
-        upper = max(effective_min, safe_max)
-        if strength == "small":
-            default_target = upper
-        elif strength == "strong":
-            default_target = lower
-        else:
-            default_target = (lower + upper) / 2.0
-        return lower, upper, default_target, strength
+    if bool(metadata.get("cycle_is_risky", False)):
+        return lower, upper, _llm_default_safe_target(metadata), strength
 
-    min_step, max_step, default_step = _step_range_for_strength(strength)
+    baseline = max(lower, min(upper, current_angle))
+    ratio = _llm_adjustment_ratio_for_strength(strength)
     if direction == "up":
-        return (
-            current_angle + min_step,
-            current_angle + max_step,
-            current_angle + default_step,
-            strength,
-        )
+        return lower, upper, baseline + ((upper - baseline) * ratio), strength
     if direction == "down":
-        return (
-            current_angle - max_step,
-            current_angle - min_step,
-            current_angle - default_step,
-            strength,
-        )
+        return lower, upper, baseline - ((baseline - lower) * ratio), strength
     return None
+
+
+def _llm_safe_target_bounds(metadata: dict[str, Any]) -> tuple[float, float] | None:
+    try:
+        lower = float(metadata["effective_min_shoulder_deg"])
+        pilot_max = float(metadata.get("pilot_functional_max_shoulder_deg", 80.0))
+        robot_max = float(metadata.get("robot_max_reachable_shoulder_deg", max(lower, pilot_max)))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    upper = min(robot_max, max(lower, pilot_max))
+    if lower > upper:
+        upper = lower
+    return lower, upper
+
+
+def _llm_default_safe_target(metadata: dict[str, Any]) -> float:
+    bounds = _llm_safe_target_bounds(metadata)
+    if bounds is None:
+        return LLM_DEFAULT_SAFE_TARGET_DEG
+    lower, upper = bounds
+    try:
+        default_target = float(metadata.get("llm_default_safe_target_deg", LLM_DEFAULT_SAFE_TARGET_DEG))
+    except (TypeError, ValueError):
+        default_target = LLM_DEFAULT_SAFE_TARGET_DEG
+    if lower > LLM_DEFAULT_SAFE_TARGET_DEG + LLM_SAFE_TARGET_UPPER_BUFFER_DEG:
+        default_target = lower
+    return max(lower, min(upper, default_target))
 
 
 def _adjustment_strength_from_text(voice_text: str) -> str:
@@ -656,14 +665,12 @@ def _adjustment_strength_from_text(voice_text: str) -> str:
     return "normal"
 
 
-def _step_range_for_strength(strength: str) -> tuple[float, float, float]:
+def _llm_adjustment_ratio_for_strength(strength: str) -> float:
     if strength == "small":
-        min_step, max_step = LLM_SMALL_ADJUSTMENT_RANGE_DEG
-    elif strength == "strong":
-        min_step, max_step = LLM_STRONG_ADJUSTMENT_RANGE_DEG
-    else:
-        min_step, max_step = LLM_NORMAL_ADJUSTMENT_RANGE_DEG
-    return min_step, max_step, (min_step + max_step) / 2.0
+        return LLM_SMALL_ADJUSTMENT_RATIO
+    if strength == "strong":
+        return LLM_STRONG_ADJUSTMENT_RATIO
+    return LLM_NORMAL_ADJUSTMENT_RATIO
 
 
 def _clear_adjustment_direction_from_text(voice_text: str) -> str | None:
@@ -712,22 +719,13 @@ def resolve_rule_worker_target_angle_by_policy(
 
     try:
         current_angle = float(metadata["cycle_representative_shoulder_angle_deg"])
-        effective_min = float(metadata["effective_min_shoulder_deg"])
-        safe_max = float(metadata.get("pilot_functional_max_shoulder_deg", 80.0))
-        up_step_deg = float(metadata.get("rule_worker_up_step_deg", RULE_WORKER_UP_STEP_DEG))
-        down_step_deg = float(
-            metadata.get("rule_worker_down_step_deg", RULE_WORKER_DOWN_STEP_DEG)
-        )
-        cycle_is_risky = bool(metadata.get("cycle_is_risky", False))
     except (KeyError, TypeError, ValueError):
         return None
 
     if direction == "up":
-        return max(0.0, min(180.0, current_angle + up_step_deg))
+        return max(0.0, min(180.0, current_angle + 1.0))
     if direction == "down":
-        if cycle_is_risky:
-            return max(effective_min, safe_max)
-        return max(0.0, min(180.0, current_angle - down_step_deg))
+        return max(0.0, min(180.0, current_angle - 1.0))
     return None
 
 
@@ -766,33 +764,16 @@ def _apply_rule_worker_policy(
         )
         return response
 
-    target_angle = resolve_rule_worker_target_angle_by_policy(metadata, direction)
-    if target_angle is None:
-        response.update(
-            {
-                "answered": False,
-                "action": "unknown",
-                "target_shoulder_angle_deg": None,
-                "is_invalid": True,
-                "reason": "Rule policy could not calculate a target shoulder angle.",
-            }
-        )
-        return response
-
     policy_reason = (
-        "Rule policy applied current shoulder angle +10 degrees."
+        "Rule policy will apply robot z +50mm."
         if direction == "up"
-        else (
-            "Rule policy guided the risky posture to the safe-range upper bound."
-            if bool((metadata or {}).get("cycle_is_risky", False))
-            else "Rule policy applied current shoulder angle -10 degrees."
-        )
+        else "Rule policy will apply robot z -50mm."
     )
     response.update(
         {
             "answered": True,
             "action": "adjust",
-            "target_shoulder_angle_deg": target_angle,
+            "target_shoulder_angle_deg": None,
             "is_invalid": False,
             "reason": f"{response.get('reason', '')} {policy_reason}".strip(),
         }
@@ -869,14 +850,30 @@ def _llm_worker_retry_reason(
             return "Robot-relative shoulder-angle metadata is missing or invalid."
 
         tolerance_deg = RULE_MIN_ANGLE_TOLERANCE_DEG
-        at_lower_limit = current_robot_angle <= effective_min + tolerance_deg
-        at_upper_limit = current_robot_angle >= robot_max - tolerance_deg
-        if direction == "up" and target_angle <= current_worker_angle:
-            if not (at_upper_limit and target_angle >= current_worker_angle - tolerance_deg):
-                return "Upward intent produced a non-upward target angle."
-        if direction == "down" and target_angle >= current_worker_angle:
-            if not (at_lower_limit and target_angle <= current_worker_angle + tolerance_deg):
-                return "Downward intent produced a non-downward target angle."
+        condition = (metadata or {}).get("condition", {})
+        llm_safe_policy_applies = isinstance(condition, dict) and condition.get("control") == "LLM"
+        if llm_safe_policy_applies:
+            bounds = _llm_safe_target_bounds(metadata or {})
+            if bounds is None:
+                return "LLM safe-range metadata is missing or invalid."
+            safe_lower, safe_upper = bounds
+            if target_angle < safe_lower - tolerance_deg or target_angle > safe_upper + tolerance_deg:
+                return "LLM target angle is outside the safe 60-80 policy range."
+            if not bool((metadata or {}).get("cycle_is_risky", False)):
+                baseline = max(safe_lower, min(safe_upper, current_worker_angle))
+                if direction == "up" and target_angle < baseline - tolerance_deg:
+                    return "Upward intent produced a target below the safe-range baseline."
+                if direction == "down" and target_angle > baseline + tolerance_deg:
+                    return "Downward intent produced a target above the safe-range baseline."
+        else:
+            at_lower_limit = current_robot_angle <= effective_min + tolerance_deg
+            at_upper_limit = current_robot_angle >= robot_max - tolerance_deg
+            if direction == "up" and target_angle <= current_worker_angle:
+                if not (at_upper_limit and target_angle >= current_worker_angle - tolerance_deg):
+                    return "Upward intent produced a non-upward target angle."
+            if direction == "down" and target_angle >= current_worker_angle:
+                if not (at_lower_limit and target_angle <= current_worker_angle + tolerance_deg):
+                    return "Downward intent produced a non-downward target angle."
 
     normalized = _normalize(voice_text)
     if _is_directionless_confirmation(normalized):

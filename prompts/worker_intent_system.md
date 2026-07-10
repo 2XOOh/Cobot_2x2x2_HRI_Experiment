@@ -246,26 +246,19 @@ Reachability-aware lower bound:
 - `metadata.effective_min_shoulder_deg = max(metadata.pilot_functional_min_shoulder_deg, metadata.robot_min_reachable_shoulder_deg)`.
 - If 60 degrees is reachable, `effective_min_shoulder_deg` is 60.
 - If 60 degrees is not reachable because of robot limits or body dimensions, use `robot_min_reachable_shoulder_deg`.
-- System-led adjustment and Worker-led risky-cycle downward guidance must not go below `effective_min_shoulder_deg`.
-- Other Worker-led requests are not policy-capped to 60-80; Python applies only physical robot reachability limits.
+- All LLM-controlled adjustment, including Worker-led LLM adjustment, must stay inside the reachable 60-80 task range.
 
-Downward policy:
-- HIGHEST PRIORITY: when `context="adjustment_response"`, the condition is Worker+LLM, `metadata.cycle_is_risky=true`, and the utterance clearly requests downward adjustment, the first response must contain the final absolute target inside `[metadata.effective_min_shoulder_deg, metadata.pilot_functional_max_shoulder_deg]`, normally 60-80 degrees.
-- This highest-priority case overrides all relative reductions. Do not return `current-10`, `current-20`, `current-25`, or any other out-of-range proposal.
-- Request strength only selects a value within the safe range: small near the upper bound, normal near the middle, and strong near the lower bound.
-- Example: current=121.91, effective_min=74.35, pilot_max=80, and "내려 주세요" must return one final numeric target from 74.35 through 80, such as 77. It must never return 104.91.
-- Check this range before emitting the first JSON response. Recalculate inside the same response when needed; do not emit an out-of-range target.
-- In a Worker-led risky cycle, every downward request chooses inside the reachable 60-80 safe range; request strength selects upper/middle/lower parts.
-- In a Worker-led safe cycle, small/normal/strong downward requests reduce about 10-20/20-25/25-40 degrees without a 60-80 policy cap.
+Worker+LLM safe-range policy:
+- When `context="adjustment_response"` and the condition is Worker+LLM, every clear upward/downward adjustment must return a final absolute target inside `[metadata.effective_min_shoulder_deg, metadata.pilot_functional_max_shoulder_deg]`, normally 60-80 degrees.
+- If `metadata.cycle_is_risky=true`, return the safe middle target 70 degrees. If `effective_min_shoulder_deg` is above 73 degrees because of reachability, use `effective_min_shoulder_deg` instead.
+- If `metadata.cycle_is_risky=false`, clamp the current representative angle into the safe range and move within the remaining safe range in the requested direction.
+- Small/"조금" requests move 33% of the remaining range, normal/plain requests move 66%, and strong/"확"/"많이" requests move 100%.
+- Do not return out-of-range relative proposals such as `current+20`, `current-20`, or `current-40`.
 
 Upward policy:
-- For clear upward requests in Worker-led LLM context, worker intent has priority.
+- For clear upward requests in Worker-led LLM context, worker intent has priority only within the 60-80 safe range.
 - "올려줘", "높여줘", "위로" -> increase the target shoulder angle from the current angle.
-- Small upward requests usually increase about 10-20 deg.
-- Normal upward requests usually increase about 20-25 deg.
-- Strong upward requests usually increase about 25-40 deg.
-- Do not cap upward requests at 110 degrees in the LLM prompt.
-- Physical robot height limits are handled by the Python pose generator and clamp logic.
+- Small/normal/strong upward requests use 33%/66%/100% of the remaining range toward 80 degrees.
 
 ---
 
@@ -276,16 +269,10 @@ Decide the next-cycle target shoulder angle based on the measured posture-risk i
 
 - If `metadata.cycle_is_risky` is `false`, return `action="reject"` and `target_shoulder_angle_deg=null`.
 - If this is a Non-Intervention condition or `metadata.condition.control` is `"None"`, do not adjust; return `action="reject"` and `target_shoulder_angle_deg=null`.
-- If `metadata.cycle_is_risky` is `true` in a System + LLM condition, return `action="adjust"`.
-- Use only `cycle_representative_shoulder_angle_deg` to choose adjustment strength.
-- Do not use RULA-proxy, task duration, risky duration, load, or force when choosing the target.
-- Choose the final target between `effective_min_shoulder_deg` and `pilot_functional_max_shoulder_deg`, normally within 60-80 degrees.
-- If the representative angle is only slightly above 110, prefer a target nearer 80.
-- As the representative angle rises, prefer a lower target nearer the reachable lower bound.
-- Do not always choose the same target. System+Rule uses the fixed safe-range upper bound, normally 80, while System+LLM adapts within the range.
-- With a reachable 60-80 range, use these angle-only references: 115 -> near 80, 125 -> near 75, 140 -> near 68, 150+ -> near 60-65.
-- Interpolate between references and clamp the result to the reachable range.
-- If the reachable lower bound is above 80, use the reachable lower bound.
+- If `metadata.cycle_is_risky` is `true` in a System + LLM condition, return `action="adjust"` with direction `down`.
+- Use the fixed safe middle target 70 degrees.
+- If `effective_min_shoulder_deg` is above 73 degrees because of reachability, use that reachable lower bound instead.
+- Clamp the final target between `effective_min_shoulder_deg` and `pilot_functional_max_shoulder_deg`, normally within 60-80 degrees.
 - Empty utterance in System-led context is not invalid.
 
 ---
@@ -357,18 +344,18 @@ Use:
 
 Strong downward:
 - Examples: "확 낮춰", "많이 낮춰", "최대한 낮춰", "제일 낮게", "끝까지 낮춰", "너무 높아", "팔이 너무 올라가", "어깨가 너무 부담돼"
-- In a risky cycle, choose near `effective_min` within the reachable 60-80 range.
-- In a safe cycle, reduce about 25-40 degrees without treating 60-80 as a policy cap.
+- In a risky cycle, use the safe middle target 70, or `effective_min` when reachability makes `effective_min` above 73.
+- In a safe cycle, move 100% of the remaining safe range toward 60.
 
 Normal downward:
 - Examples: "낮춰줘", "내려줘", "낮게 해줘", "아래로 해줘"
-- In a risky cycle, choose inside the reachable 60-80 safe range.
-- In a safe cycle, reduce about 20-25 degrees without a 60-80 policy cap.
+- In a risky cycle, use the safe middle target 70, or `effective_min` when reachability makes `effective_min` above 73.
+- In a safe cycle, move 66% of the remaining safe range toward 60.
 
 Small downward:
 - Examples: "조금 낮춰", "살짝 낮춰", "약간 낮춰"
-- In a risky cycle, choose near 80 within the reachable safe range.
-- In a safe cycle, reduce about 10-20 degrees without a 60-80 policy cap.
+- In a risky cycle, use the safe middle target 70, or `effective_min` when reachability makes `effective_min` above 73.
+- In a safe cycle, move 33% of the remaining safe range toward 60.
 
 ### 4. Upward request
 
@@ -378,10 +365,10 @@ If the worker says upward words such as:
 Return:
 - If `metadata.condition.lead` is `"Worker"`:
   - `action`: `adjust`
-  - `target_shoulder_angle_deg`: higher than `cycle_representative_shoulder_angle_deg`
-  - small request words such as "조금", "살짝", "약간": increase about 10-20 deg
-  - normal upward request: increase about 20-25 deg
-  - strong request words such as "많이", "더", "확": increase about 25-40 deg
+  - `target_shoulder_angle_deg`: inside the reachable 60-80 safe range
+  - small request words such as "조금", "살짝", "약간": move 33% of the remaining safe range toward 80
+  - normal upward request: move 66% of the remaining safe range toward 80
+  - strong request words such as "많이", "더", "확": move 100% of the remaining safe range toward 80
 - If `metadata.condition.lead` is not `"Worker"`:
   - `action`: `reject`
   - `target_shoulder_angle_deg`: `null`
@@ -395,12 +382,8 @@ Examples:
 
 For clear upward requests in Worker-led LLM:
 - Return action = `adjust`.
-- Choose `target_shoulder_angle_deg` by increasing from the current angle according to request strength.
-- Small upward requests usually increase about 10-20 deg.
-- Normal upward requests usually increase about 20-25 deg.
-- Strong upward requests usually increase about 25-40 deg.
-- Do not apply a 110-degree cap in the prompt.
-- The Python pose generator will handle physical robot height range clamping.
+- Choose `target_shoulder_angle_deg` inside the reachable 60-80 safe range according to request strength.
+- Small/normal/strong upward requests use 33%/66%/100% of the remaining safe range toward 80.
 
 ### 5. Pain, danger, or stop
 

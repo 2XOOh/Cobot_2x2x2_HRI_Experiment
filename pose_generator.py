@@ -16,7 +16,7 @@ PASS_Y_LINK0_M = -0.103
 
 # 로봇 link0 기준 TCP z 사용 가능 범위다.
 MIN_LINK0_Z_M = 0.30
-MAX_LINK0_Z_M = 1.00
+MAX_LINK0_Z_M = 0.94
 
 # 4차 측정 quaternion 샘플이다. 각 항목은 (바닥 기준 높이 H, quaternion xyzw) 형식이다.
 # position은 수식 모델로 만들고, orientation은 이 샘플 사이를 높이 기준으로 slerp 보간한다.
