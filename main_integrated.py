@@ -237,12 +237,6 @@ def main():
             return current_floor_height_m - step_m
         return current_floor_height_m
 
-    def is_policy_risky_cycle(cycle) -> bool:
-        return (
-            bool(cycle.is_risky_cycle)
-            or cycle.representative_shoulder_angle_deg >= RISK_SHOULDER_DEG
-        )
-
     print(
         "[RULE 높이 정책] "
         f"로봇 최저 도달 어깨각={robot_min_shoulder_deg:.2f}도 | "
@@ -329,8 +323,7 @@ def main():
             "cycle_task_time_sec": cycle.task_time_s,
             "cycle_risky_time_sec": cycle.risky_time_s,
             "cycle_risky_ratio": cycle.risky_ratio,
-            "cycle_is_risky": is_policy_risky_cycle(cycle),
-            "cycle_ratio_is_risky": cycle.is_risky_cycle,
+            "cycle_is_risky": cycle.is_risky_cycle,
             "cycle_representative_shoulder_angle_deg": cycle.representative_shoulder_angle_deg,
             "cycle_avg_elbow_angle_deg": cycle.avg_elbow_angle_deg,
             "cycle_avg_rula_proxy_score": cycle.avg_rula_proxy,
@@ -380,10 +373,12 @@ def main():
 
     def worker_target_limit_message(direction, target_shoulder_angle_deg):
         current_floor_height_m = current_tighten_z_mm / 1000.0
+        target_angle_deg = None
 
         if target_shoulder_angle_deg is not None:
+            target_angle_deg = clamp_llm_safe_angle(float(target_shoulder_angle_deg))
             preview = pose_generator.generate_pose_from_shoulder_angle(
-                float(target_shoulder_angle_deg),
+                target_angle_deg,
                 human_profile,
             )
             if abs(preview.target_floor_height_m - current_floor_height_m) > 1e-6:
@@ -399,6 +394,35 @@ def main():
                 "현재 로봇이 전달할 수 있는 최고 높이입니다. "
                 "더 높여서 전달할 수 없습니다. 다시 말씀해 주세요."
             )
+        if target_angle_deg is not None and current_condition["control"] == "LLM":
+            current_robot_angle_deg = shoulder_angle_from_floor_height_deg(
+                shoulder_height_m=human_profile.shoulder_height_m,
+                total_arm_length_m=human_profile.total_arm_length_m,
+                floor_height_m=current_floor_height_m,
+            )
+            angle_tolerance_deg = 0.05
+            if (
+                direction == "up"
+                and (
+                    target_angle_deg >= safe_range_upper_shoulder_deg - angle_tolerance_deg
+                    or current_robot_angle_deg >= safe_range_upper_shoulder_deg - angle_tolerance_deg
+                )
+            ):
+                return (
+                    "현재 안전 범위의 최고 높이입니다. "
+                    "안전 범위를 넘어 더 높일 수 없습니다. 다시 말씀해 주세요."
+                )
+            if (
+                direction == "down"
+                and (
+                    target_angle_deg <= effective_min_shoulder_deg + angle_tolerance_deg
+                    or current_robot_angle_deg <= effective_min_shoulder_deg + angle_tolerance_deg
+                )
+            ):
+                return (
+                    "현재 안전 범위의 최저 높이입니다. "
+                    "안전 범위를 넘어 더 낮출 수 없습니다. 다시 말씀해 주세요."
+                )
         return None
 
     def worker_adjustment_ack_message(worker_response):
@@ -414,7 +438,8 @@ def main():
         if (
             current_condition["control"] == "LLM"
             and current_cycle_result is not None
-            and is_policy_risky_cycle(current_cycle_result)
+            and bool(current_cycle_result.is_risky_cycle)
+            # and is_policy_risky_cycle(current_cycle_result)
         ):
             return "네, 안전 각도로 조정하겠습니다."
 
@@ -756,7 +781,8 @@ def main():
         if entered_returning and completion_sent:
             SetReviewPending(True)
             user_response_text = ""
-            policy = decide_returning_policy(current_condition, is_policy_risky_cycle(current_cycle_result))
+            # policy = decide_returning_policy(current_condition, is_policy_risky_cycle(current_cycle_result))
+            policy = decide_returning_policy(current_condition, bool(current_cycle_result.is_risky_cycle))
             speak(policy["message"])
             if policy["mode"] == "ask_worker":
                 tts_speaker.wait_until_done()
