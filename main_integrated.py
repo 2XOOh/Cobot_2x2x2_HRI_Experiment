@@ -17,7 +17,6 @@ from voice_intent_interface import (
     ContinuousSpeechRecognizer,
     LlmIntentParser,
     QueuedTtsSpeaker,
-    RuleIntentParser,
     is_task_completion_input,
     parse_worker_adjustment_input,
 )
@@ -35,17 +34,20 @@ PILOT_FUNCTIONAL_MIN_SHOULDER_DEG = 60.0
 PILOT_FUNCTIONAL_MAX_SHOULDER_DEG = 80.0
 LLM_DEFAULT_SAFE_TARGET_DEG = 70.0
 LLM_SAFE_TARGET_UPPER_BUFFER_DEG = 3.0
+LLM_SMALL_ADJUSTMENT_RATIO = 0.33
+LLM_NORMAL_ADJUSTMENT_RATIO = 0.66
+LLM_STRONG_ADJUSTMENT_RATIO = 1.0
 RULE_Z_STEP_MM = 50.0
 ROBOT_STATE_POLL_SEC = 0.2
 RISK_SHOULDER_DEG = 110.0
 RISKY_CYCLE_RATIO_THRESHOLD = 0.60
 RULA_HIGH_SCORE_THRESHOLD = 3.0
 
-CAMERA_FRAME_WIDTH = 1280
-CAMERA_FRAME_HEIGHT = 720
+CAMERA_FRAME_WIDTH = 720
+CAMERA_FRAME_HEIGHT = 1280
 DISPLAY_WINDOW_NAME = "HRI Ergonomic Bolt Fastening Task"
-DISPLAY_WINDOW_WIDTH = 1280
-DISPLAY_WINDOW_HEIGHT = 720
+DISPLAY_WINDOW_WIDTH = 720
+DISPLAY_WINDOW_HEIGHT = 1280
 
 RESULT_DIR = os.path.join(os.path.dirname(__file__), "results")
 
@@ -235,6 +237,31 @@ def main():
             return effective_min_shoulder_deg
         return clamp_llm_safe_angle(LLM_DEFAULT_SAFE_TARGET_DEG)
 
+    def worker_llm_target_policy(current_angle_deg: float) -> dict:
+        lower = effective_min_shoulder_deg
+        upper = safe_range_upper_shoulder_deg
+        baseline = max(lower, min(upper, float(current_angle_deg)))
+        default_target = default_llm_safe_target_angle()
+
+        def rounded(value: float) -> float:
+            return round(float(value), 1)
+
+        return {
+            "safe_min_shoulder_deg": rounded(lower),
+            "safe_max_shoulder_deg": rounded(upper),
+            "baseline_shoulder_deg": rounded(baseline),
+            "small_ratio": LLM_SMALL_ADJUSTMENT_RATIO,
+            "normal_ratio": LLM_NORMAL_ADJUSTMENT_RATIO,
+            "strong_ratio": LLM_STRONG_ADJUSTMENT_RATIO,
+            "small_up_target_deg": rounded(baseline + (upper - baseline) * LLM_SMALL_ADJUSTMENT_RATIO),
+            "normal_up_target_deg": rounded(baseline + (upper - baseline) * LLM_NORMAL_ADJUSTMENT_RATIO),
+            "strong_up_target_deg": rounded(upper),
+            "small_down_target_deg": rounded(baseline - (baseline - lower) * LLM_SMALL_ADJUSTMENT_RATIO),
+            "normal_down_target_deg": rounded(baseline - (baseline - lower) * LLM_NORMAL_ADJUSTMENT_RATIO),
+            "strong_down_target_deg": rounded(lower),
+            "risky_override_target_deg": rounded(default_target),
+        }
+
     def current_rule_step_floor_height_m(direction: str) -> float:
         step_m = RULE_Z_STEP_MM / 1000.0
         current_floor_height_m = current_tighten_z_mm / 1000.0
@@ -261,8 +288,7 @@ def main():
         choice = 1
     current_condition = CONDITIONS.get(choice, CONDITIONS[1])
 
-    # 음성 입력은 완료 감지, rule 응답, LLM 조정 의도 해석으로 나누어 처리한다.
-    rule_intent_parser = RuleIntentParser()
+    # 음성 입력은 완료/조정 의도를 LLM으로 해석하고, 제어 정책은 조건별로 적용한다.
     llm_intent_parser = LlmIntentParser(api_key=OPENAI_API_KEY, base_url=LLAMA_BASE_URL) if OPENAI_API_KEY else None
     speech_recognizer = ContinuousSpeechRecognizer(
         on_text=lambda text: print(f"🗣️ [음성 인식]: '{text}'")
@@ -301,6 +327,17 @@ def main():
         except Exception as e:
             print(f"[PASS_GOAL JSON 저장 실패] {e}")
 
+    def save_llm_response_json(label):
+        if llm_intent_parser is None or llm_intent_parser.last_response_record is None:
+            return
+        payload = dict(llm_intent_parser.last_response_record)
+        payload["label"] = label
+        try:
+            json_path = data_logger.write_llm_response_json(payload, label)
+            print(f"[LLM JSON 저장] {json_path}")
+        except Exception as e:
+            print(f"[LLM JSON 저장 실패] {e}")
+
     trial_count = 0
     wait_start_time = 0.0
     current_tighten_z_mm = 0.0
@@ -328,56 +365,37 @@ def main():
         )
 
         return {
-            "condition": current_condition,
-            "cycle_task_time_sec": cycle.task_time_s,
-            "cycle_risky_time_sec": cycle.risky_time_s,
-            "cycle_risky_ratio": cycle.risky_ratio,
+            "condition": {
+                "intervention": current_condition["intervention"],
+                "lead": current_condition["lead"],
+                "control": current_condition["control"],
+            },
             "cycle_is_risky": cycle.is_risky_cycle,
             "cycle_representative_shoulder_angle_deg": cycle.representative_shoulder_angle_deg,
-            "cycle_avg_elbow_angle_deg": cycle.avg_elbow_angle_deg,
-            "cycle_avg_rula_proxy_score": cycle.avg_rula_proxy,
-            "cycle_max_rula_proxy_score": cycle.max_rula_proxy,
-            "cycle_rula_high_ratio": cycle.rula_high_ratio,
-            "current_work_z_mm": current_tighten_z_mm,
-            "pilot_functional_min_shoulder_deg": PILOT_FUNCTIONAL_MIN_SHOULDER_DEG,
-            "pilot_functional_max_shoulder_deg": PILOT_FUNCTIONAL_MAX_SHOULDER_DEG,
-            "robot_min_reachable_shoulder_deg": robot_min_shoulder_deg,
-            "robot_max_reachable_shoulder_deg": robot_max_shoulder_deg,
             "effective_min_shoulder_deg": effective_min_shoulder_deg,
+            "pilot_functional_max_shoulder_deg": PILOT_FUNCTIONAL_MAX_SHOULDER_DEG,
             "current_robot_shoulder_angle_deg": current_robot_shoulder_deg,
+            "robot_max_reachable_shoulder_deg": robot_max_shoulder_deg,
             "llm_default_safe_target_deg": default_llm_safe_target_angle(),
-            "rule_z_step_mm": RULE_Z_STEP_MM,
-            "robot_min_floor_height_m": pose_generator.min_floor_height_m,
+            "llm_target_policy": worker_llm_target_policy(current_robot_shoulder_deg),
             "risk_trigger_deg": RISK_SHOULDER_DEG,
-            "user_shoulder_height_mm": user_shoulder_height_cm * 10,
-            "upper_arm_mm": l1_cm * 10,
-            "forearm_mm": l2_cm * 10,
-            "drill_tcp_offset_mm": DRILL_TCP_OFFSET_CM * 10,
-            "total_arm_length_mm": human_profile.total_arm_length_m * 1000.0,
         }
 
     def build_system_llm_metadata():
-        metadata = build_adjustment_metadata()
         return {
-            "condition": metadata["condition"],
-            "cycle_is_risky": metadata["cycle_is_risky"],
-            "cycle_representative_shoulder_angle_deg": metadata[
-                "cycle_representative_shoulder_angle_deg"
-            ],
-            "effective_min_shoulder_deg": metadata["effective_min_shoulder_deg"],
-            "pilot_functional_min_shoulder_deg": metadata[
-                "pilot_functional_min_shoulder_deg"
-            ],
-            "pilot_functional_max_shoulder_deg": metadata[
-                "pilot_functional_max_shoulder_deg"
-            ],
-            "robot_min_reachable_shoulder_deg": metadata[
-                "robot_min_reachable_shoulder_deg"
-            ],
-            "robot_max_reachable_shoulder_deg": metadata[
-                "robot_max_reachable_shoulder_deg"
-            ],
-            "llm_default_safe_target_deg": metadata["llm_default_safe_target_deg"],
+            "condition": {
+                "intervention": current_condition["intervention"],
+                "lead": current_condition["lead"],
+                "control": current_condition["control"],
+            },
+            "cycle_is_risky": bool(current_cycle_result.is_risky_cycle),
+            "cycle_representative_shoulder_angle_deg": (
+                current_cycle_result.representative_shoulder_angle_deg
+            ),
+            "effective_min_shoulder_deg": effective_min_shoulder_deg,
+            "pilot_functional_max_shoulder_deg": PILOT_FUNCTIONAL_MAX_SHOULDER_DEG,
+            "llm_default_safe_target_deg": default_llm_safe_target_angle(),
+            "risk_trigger_deg": RISK_SHOULDER_DEG,
         }
 
     def worker_target_limit_message(direction, target_shoulder_angle_deg):
@@ -787,8 +805,14 @@ def main():
                 key,
                 current_voice,
                 llm_parser=llm_intent_parser,
-                metadata={"condition": current_condition},
             )
+            if (
+                current_voice
+                and llm_intent_parser is not None
+                and llm_intent_parser.last_response_record is not None
+                and llm_intent_parser.last_response_record.get("context") == "task_completion"
+            ):
+                save_llm_response_json(f"trial_{trial_count + 1:03d}_task_completion")
 
             if is_done:
                 if key == ord(" "):
@@ -833,6 +857,7 @@ def main():
                     )
                     llm_latency = time.time() - llm_start_time
                     metrics.record_llm_call(llm_latency)
+                    save_llm_response_json(f"trial_{trial_count + 1:03d}_system_adjustment")
 
                     print(
                         f"[System+LLM 판단]: action={llm_decision.action}, "
@@ -896,7 +921,6 @@ def main():
                 key=key,
                 voice_text=current_voice,
                 control_type=current_condition["control"],
-                rule_parser=rule_intent_parser,
                 llm_parser=llm_intent_parser,
                 metadata=build_adjustment_metadata(),
             )
@@ -926,18 +950,23 @@ def main():
 
             if current_voice and worker_response["source"] in ("llm", "llm_error", "rule_llm"):
                 metrics.record_llm_call(worker_response["latency"])
+                save_llm_response_json(f"trial_{trial_count + 1:03d}_worker_adjustment")
 
             if worker_response["action"] == "ask_clarification" and worker_response["clarification_question"]:
                 speak_and_wait(worker_response["clarification_question"])
                 speech_recognizer.get_and_clear()
 
             if worker_response["action"] == "limit_reached":
-                speak_and_wait(
-                    "현재 로봇이 전달할 수 있는 최저 높이입니다. "
+                limit_tts = (
+                    "현재 로봇이 전달할 수 있는 최고 높이입니다. "
+                    "더 높여서 전달할 수 없습니다. 다시 말씀해 주세요."
+                    if worker_response["direction"] == "up"
+                    else "현재 로봇이 전달할 수 있는 최저 높이입니다. "
                     "더 낮춰서 전달할 수 없습니다. 다시 말씀해 주세요."
                 )
+                speak_and_wait(limit_tts)
                 speech_recognizer.get_and_clear()
-                print("[최저 높이 도달] 작업자 답변을 계속 기다립니다.")
+                print("[로봇 높이 한계 도달] 작업자 답변을 계속 기다립니다.")
             elif worker_response["answered"]:
                 should_adjust = worker_response["action"] in ("approve", "adjust")
                 limit_message = (

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import threading
 import time
 from dataclasses import asdict, dataclass
@@ -11,217 +12,51 @@ from typing import Any, Callable
 
 
 DEFAULT_SYSTEM_PROMPT_PATH = Path(__file__).with_name("prompts") / "worker_intent_runtime.md"
-# The keyword lists below are used by RuleIntentParser and simple non-LLM checks.
-# Worker + LLM conditions send the full utterance to the LLM prompt instead.
-TASK_COMPLETION_KEYWORDS = (
-    "끝",
-    "종료",
-    "완료",
-    "다했",
-    "다 했",
-    "다됐",
-    "다 됐",
-    "끝냈",
-    "끝났",
-    "마쳤",
-    "마무리",
-    "다뺐",
-    "다 뺐",
-    "다풀었",
-    "다 풀었",
-    "finished",
-    "done",
-)
-APPROVE_KEYWORDS = ("응", "어", "네", "예", "그래", "좋아", "오케이", "ok", "맞아", "해줘", "조정")
-REJECT_KEYWORDS = ("아니", "아니요", "괜찮", "그대로", "하지마", "필요없", "됐어", "no", "노")
-UPWARD_ADJUST_KEYWORDS = ("올려", "올리", "높여", "위로", "높게")
-DOWNWARD_ADJUST_KEYWORDS = ("낮춰", "낮추", "내려", "내리", "아래로", "낮게")
+DEFAULT_LLM_RESPONSE_LOG_PATH = Path(__file__).with_name("results") / "llm_response_log.jsonl"
 LLM_ACTION_CONFIDENCE_THRESHOLD = 0.75
 RULE_MIN_ANGLE_TOLERANCE_DEG = 1.0
-LLM_DEFAULT_SAFE_TARGET_DEG = 70.0
-LLM_SAFE_TARGET_UPPER_BUFFER_DEG = 3.0
-LLM_SMALL_ADJUSTMENT_RATIO = 0.33
-LLM_NORMAL_ADJUSTMENT_RATIO = 0.66
-LLM_STRONG_ADJUSTMENT_RATIO = 1.0
-AMBIGUOUS_ASR_PHRASES = (
-    "알겠",
-    "알았",
-    "알아먹",
-    "알아들",
-    "다시해",
-    "그렇게해",
-    "그걸로해",
-    "그냥해",
-)
-DIRECTIONLESS_ADJUSTMENT_HINTS = ("조정", "변경", "바꿔", "바꾸")
-DIRECTION_OR_MAINTAIN_HINTS = (
-    *UPWARD_ADJUST_KEYWORDS,
-    *DOWNWARD_ADJUST_KEYWORDS,
-    *REJECT_KEYWORDS,
-    "유지",
-    "이대로",
-    "현재",
-    "위쪽",
-    "아래쪽",
-)
-IGNORED_TTS_ECHO_PHRASES = (
-    "인식하지못",
-    "다시말씀",
-    "유지할지올릴지내릴지",
-    "높이를유지할지",
-    "불편자세를감지",
-    "안전자세가감지",
-    "작업높이를변경해드릴까요",
-    "작업높이를변경할까요",
-    "현재로봇이전달할수있는최저높이",
-    "더낮춰서전달할수없습니다",
-    "현재로봇이전달할수있는최고높이",
-    "더높여서전달할수없습니다",
-)
-DIRECTIONLESS_CONFIRMATION_PHRASES = (
-    "응",
-    "어",
-    "네",
-    "예",
-    "그래",
-    "좋아",
-    "오케이",
-    "ok",
-    "맞아",
-    "해줘",
-    "해주세요",
-    "조정해줘",
-    "조정해주세요",
-    "바꿔줘",
-    "바꿔주세요",
-    "변경해줘",
-    "변경해주세요",
-    "알겠어",
-    "알겠어요",
-    "알겠습니다",
-    "알았어",
-    "알았어요",
-    "알았습니다",
-    "알아먹었어",
-    "알아먹었어요",
-    "알아들었어",
-    "알아들었어요",
-)
-DIRECTIONLESS_MODIFIER_PHRASES = (
-    "조금",
-    "조금만",
-    "조금만 더",
-    "살짝",
-    "약간",
-    "많이",
-    "확",
-    "더",
-    "엄청",
-    "엄청 조금만",
-    "조금만 해줘",
-    "살짝 해줘",
-    "약간 해줘",
-)
-SMALL_ADJUSTMENT_HINTS = (
-    "조금",
-    "조금만",
-    "살짝",
-    "약간",
-    "약간만",
-    "쪼금",
-)
-STRONG_ADJUSTMENT_HINTS = (
-    "확",
-    "팍",
-    "푹",
-    "훅",
-    "팝",
-    "많이",
-    "최대한",
-    "제일",
-    "끝까지",
-    "더",
-    "강하게",
-    "크게",
-    "엄청",
-)
-ADJUSTMENT_REQUEST_HINTS = (
-    "줘",
-    "주세요",
-    "주라",
-    "줘라",
-    "해줘라",
-    "해주라",
-    "줄래",
-    "달라",
-    "달라고",
-    "라고",
-    "라니까",
-    "해봐",
-    "하자",
-    "할게",
-    "해야",
-    "야돼",
-    "야되",
-    "야할",
-    "야될",
-    "야겠",
-    "겠습니다",
-)
-HEIGHT_POSTURE_HINTS = (
-    "높이",
-    "자세",
-    "어깨",
-    "팔",
-    "불편",
-    "부담",
-    "편하",
-    "편해",
-    "위쪽",
-    "위로",
-    "아래",
-    "낮",
-    "높",
-    "내려",
-    "내리",
-    "올려",
-    "올리",
-    "유지",
-    "그대로",
-    "괜찮",
-    "필요없",
-    "됐어",
-    "조정",
-    "변경",
-    "바꿔",
-)
+SMALL_STEP_MAX_DELTA_DEG = 10.0
+WORKER_ADJUSTMENT_CLARIFICATION_QUESTION = "높이를 유지할지, 올릴지, 내릴지 말씀해 주세요."
 
 
 @dataclass
+# LLM 의도 해석 결과를 main 루프에서 쓰기 쉬운 구조로 담는다.
 class LlmAdjustmentDecision:
-    # LLM이 사용자 의도와 상태를 보고 조정 여부와 목표 어깨각을 판단한 결과를 담는다.
+    # action: complete/adjust/reject/ask_clarification/unknown 등 LLM이 판단한 의도 분류다.
     action: str = "unknown"
+    # direction: 조정 방향을 up/down/unclear 중 하나로 담는다.
     direction: str = "unclear"
     target_shoulder_angle_deg: float | None = None
     confidence: float = 0.0
+    # reason: LLM이 판단 근거를 설명한 텍스트다.
     reason: str = ""
+    # raw_text: 작업자 발화 원문 또는 LLM에 보낸 입력 문장이다.
     raw_text: str = ""
+    # raw_response_text: LLM API가 돌려준 JSON 문자열 원문이다.
+    raw_response_text: str = ""
+    # source: 응답 출처를 llm/llm_error/rule_llm/manual 등으로 구분한다.
     source: str = "llm"
+    # is_invalid: LLM이 명령을 무효 또는 부적절하다고 판단했는지 표시한다.
     is_invalid: bool = False
+    # clarification_question: 추가 확인이 필요할 때 작업자에게 물어볼 문장이다.
     clarification_question: str = ""
 
+    # LLM 의도 해석 결과를 dict 형태로 변환한다.
     def to_dict(self) -> dict[str, Any]:
         # CSV 기록이나 디버깅용으로 dataclass를 dict로 변환한다.
         return asdict(self)
 
 
+# TTS 문장을 별도 큐와 thread로 순차 재생한다.
 class QueuedTtsSpeaker:
     # TTS 요청을 큐에 쌓아 main loop를 막지 않고 순차적으로 말하게 한다.
+    # TTS 큐와 worker thread 상태를 초기화한다.
     def __init__(self) -> None:
         self._queue: queue.Queue[str | None] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
 
+    # TTS worker thread를 필요할 때 시작한다.
     def start(self) -> None:
         # TTS worker thread가 없을 때만 새로 시작한다.
         with self._lock:
@@ -230,6 +65,7 @@ class QueuedTtsSpeaker:
             self._thread = threading.Thread(target=self._worker, daemon=True)
             self._thread.start()
 
+    # 재생할 TTS 문장을 큐에 넣는다.
     def speak(self, text: str) -> None:
         # 말할 문장을 큐에 추가한다.
         if not text:
@@ -237,10 +73,12 @@ class QueuedTtsSpeaker:
         self.start()
         self._queue.put(text)
 
+    # TTS worker thread에 종료 신호를 보낸다.
     def stop(self) -> None:
         # TTS worker thread에 종료 신호를 보낸다.
         self._queue.put(None)
 
+    # 큐에 쌓인 TTS 문장이 모두 처리될 때까지 기다린다.
     def wait_until_done(self, timeout_sec: float | None = None) -> None:
         deadline = None if timeout_sec is None else time.time() + timeout_sec
         while self._queue.unfinished_tasks:
@@ -248,6 +86,7 @@ class QueuedTtsSpeaker:
                 return
             time.sleep(0.05)
 
+    # 큐에서 문장을 꺼내 pyttsx3로 실제 음성을 재생한다.
     def _worker(self) -> None:
         # pyttsx3 엔진을 유지하면서 큐에 들어온 문장을 읽는다.
         while True:
@@ -274,8 +113,10 @@ class QueuedTtsSpeaker:
                 self._queue.task_done()
 
 
+# 백그라운드 마이크 인식을 수행하고 최신 발화만 보관한다.
 class ContinuousSpeechRecognizer:
     # 마이크를 백그라운드에서 계속 듣고, 가장 최근 인식 문장을 보관한다.
+    # 음성 인식 파라미터와 thread 상태를 초기화한다.
     def __init__(
         self,
         language: str = "ko-KR",
@@ -301,6 +142,7 @@ class ContinuousSpeechRecognizer:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
+    # 백그라운드 음성 인식 thread를 시작한다.
     def start(self) -> None:
         # 음성 인식 thread를 시작한다.
         if self._thread and self._thread.is_alive():
@@ -309,10 +151,12 @@ class ContinuousSpeechRecognizer:
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
+    # 백그라운드 음성 인식 thread에 정지 신호를 보낸다.
     def stop(self) -> None:
         # 음성 인식 thread 루프를 멈추도록 신호를 보낸다.
         self._stop_event.set()
 
+    # 최신 음성 인식 결과를 반환하고 내부 버퍼를 비운다.
     def get_and_clear(self) -> str | None:
         # 가장 최근 음성 인식 결과를 가져오고 내부 버퍼를 비운다.
         with self._lock:
@@ -320,6 +164,7 @@ class ContinuousSpeechRecognizer:
             self._latest_text = None
         return text
 
+    # 새 음성 인식 결과를 저장하고 callback이 있으면 전달한다.
     def _set_latest(self, text: str) -> None:
         # 인식된 문장을 저장하고 필요하면 callback에 넘긴다.
         with self._lock:
@@ -327,6 +172,7 @@ class ContinuousSpeechRecognizer:
         if self.on_text:
             self.on_text(text)
 
+    # speech_recognition 루프에서 마이크 입력을 반복 처리한다.
     def _worker(self) -> None:
         # speech_recognition으로 짧은 발화를 반복해서 인식한다.
         import speech_recognition as sr
@@ -353,21 +199,19 @@ class ContinuousSpeechRecognizer:
                     continue
 
 
+# 수동 완료 키 또는 LLM 해석으로 현재 task 완료 여부를 판단한다.
 def is_task_completion_input(
     key: int,
     voice_text: str | None,
     llm_parser: "LlmIntentParser | None" = None,
     metadata: dict[str, Any] | None = None,
 ) -> bool:
-    # 명확한 완료 표현은 즉시 처리하고, 나머지는 LLM으로 종료 의미를 해석한다.
+    # 수동 완료 키를 제외한 음성 완료 판단은 LLM으로만 해석한다.
     if key == ord(" "):
         return True
 
-    normalized = _normalize(voice_text or "")
-    if not normalized:
+    if not voice_text:
         return False
-    if _has_any(normalized, TASK_COMPLETION_KEYWORDS):
-        return True
     if llm_parser is None:
         return False
 
@@ -386,16 +230,16 @@ def is_task_completion_input(
     )
 
 
+# Worker 주도 조건에서 수동/음성 응답을 해석해 조정 응답 dict를 만든다.
 def parse_worker_adjustment_input(
     wait_start_time: float,
     key: int,
     voice_text: str | None,
     control_type: str,
-    rule_parser: "RuleIntentParser",
     llm_parser: "LlmIntentParser | None" = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    # Worker 주도 조건에서 Y/N 키, rule 응답, LLM 응답을 한 곳에서 해석한다.
+    # Worker 주도 조건에서 수동 키 입력과 LLM 응답을 한 곳에서 해석한다.
     elapsed_wait = time.time() - wait_start_time
     response = {
         "answered": False,
@@ -423,7 +267,7 @@ def parse_worker_adjustment_input(
                 "reason": "matched manual key",
                 "confidence": 1.0,
                 "clarification_question": (
-                    "높이를 유지할지, 올릴지, 내릴지 말씀해 주세요."
+                    WORKER_ADJUSTMENT_CLARIFICATION_QUESTION
                     if manual_action == "ask_clarification"
                     else ""
                 ),
@@ -435,30 +279,6 @@ def parse_worker_adjustment_input(
         return response
 
     response["text"] = voice_text
-    if _is_tts_echo(voice_text):
-        response.update(
-            {
-                "action": "ignored",
-                "source": "ignored",
-                "reason": "ignored likely TTS echo",
-            }
-        )
-        return response
-
-    if _is_directionless_modifier(_normalize(voice_text)):
-        response.update(
-            {
-                "action": "ask_clarification",
-                "direction": "unclear",
-                "source": "semantic_guard",
-                "confidence": 1.0,
-                "is_invalid": False,
-                "reason": "Adjustment strength was stated without an upward or downward direction.",
-                "clarification_question": "높이를 유지할지, 올릴지, 내릴지 말씀해 주세요.",
-            }
-        )
-        return response
-
     if control_type in ("LLM", "Rule"):
         if llm_parser is None:
             response.update(
@@ -485,21 +305,14 @@ def parse_worker_adjustment_input(
                 "is_invalid": llm_decision.is_invalid,
                 "reason": llm_decision.reason,
                 "source": llm_decision.source,
-                "clarification_question": llm_decision.clarification_question,
+                "clarification_question": WORKER_ADJUSTMENT_CLARIFICATION_QUESTION,
             }
         )
         if llm_decision.source == "llm_error":
             return response
 
         if response["action"] == "ask_clarification" and not response["clarification_question"]:
-            response["clarification_question"] = "높이를 유지할지, 올릴지, 내릴지 말씀해 주세요."
-
-        _apply_worker_llm_policy_guard(
-            voice_text,
-            response,
-            metadata,
-            control_type,
-        )
+            response["clarification_question"] = WORKER_ADJUSTMENT_CLARIFICATION_QUESTION
 
         retry_reason = _llm_worker_retry_reason(
             voice_text,
@@ -507,13 +320,91 @@ def parse_worker_adjustment_input(
             metadata,
             validate_target=control_type == "LLM",
         )
+        if (
+            retry_reason
+            and control_type == "LLM"
+            and llm_decision.source == "llm"
+            and _should_retry_llm_after_validation_failure(retry_reason)
+        ):
+            retry_metadata = _metadata_with_validation_feedback(
+                metadata,
+                retry_reason,
+                response,
+            )
+            llm_decision = llm_parser.parse(
+                voice_text,
+                context="adjustment_response",
+                metadata=retry_metadata,
+            )
+            response.update(
+                {
+                    "action": llm_decision.action,
+                    "direction": llm_decision.direction,
+                    "target_shoulder_angle_deg": llm_decision.target_shoulder_angle_deg,
+                    "latency": time.time() - llm_start_time,
+                    "confidence": llm_decision.confidence,
+                    "is_invalid": llm_decision.is_invalid,
+                    "reason": llm_decision.reason,
+                    "source": llm_decision.source,
+                    "clarification_question": WORKER_ADJUSTMENT_CLARIFICATION_QUESTION,
+                }
+            )
+            if llm_decision.source == "llm_error":
+                return response
+            retry_reason = _llm_worker_retry_reason(
+                voice_text,
+                response,
+                metadata,
+                validate_target=True,
+            )
+
+        if (
+            not retry_reason
+            and control_type == "LLM"
+            and response["action"] == "ask_clarification"
+            and llm_decision.source == "llm"
+            and _should_retry_llm_clarification(response, metadata)
+        ):
+            retry_metadata = _metadata_with_validation_feedback(
+                metadata,
+                "Clarification response should be semantically re-evaluated.",
+                response,
+            )
+            llm_decision = llm_parser.parse(
+                voice_text,
+                context="adjustment_response",
+                metadata=retry_metadata,
+            )
+            response.update(
+                {
+                    "action": llm_decision.action,
+                    "direction": llm_decision.direction,
+                    "target_shoulder_angle_deg": llm_decision.target_shoulder_angle_deg,
+                    "latency": time.time() - llm_start_time,
+                    "confidence": llm_decision.confidence,
+                    "is_invalid": llm_decision.is_invalid,
+                    "reason": llm_decision.reason,
+                    "source": llm_decision.source,
+                    "clarification_question": WORKER_ADJUSTMENT_CLARIFICATION_QUESTION,
+                }
+            )
+            if llm_decision.source == "llm_error":
+                return response
+            retry_reason = _llm_worker_retry_reason(
+                voice_text,
+                response,
+                metadata,
+                validate_target=True,
+            )
+
         if retry_reason:
+            limit_action = _limit_action_from_retry_reason(retry_reason)
             response.update(
                 {
                     "answered": False,
-                    "action": "unknown",
+                    "action": limit_action or "unknown",
                     "target_shoulder_angle_deg": None,
-                    "is_invalid": True,
+                    "is_invalid": limit_action is None,
                     "reason": retry_reason,
                     "clarification_question": "",
                 }
@@ -535,6 +426,7 @@ def parse_worker_adjustment_input(
     return response
 
 
+# Worker 응답 대기 중 입력된 수동 키를 조정 action으로 변환한다.
 def _manual_adjustment_action(key: int) -> str | None:
     # Worker 응답 대기 중 Y/N 키를 approve/reject로 바꾼다.
     if key in (ord("y"), ord("Y")):
@@ -544,104 +436,7 @@ def _manual_adjustment_action(key: int) -> str | None:
     return None
 
 
-def _apply_worker_llm_policy_guard(
-    voice_text: str,
-    response: dict[str, Any],
-    metadata: dict[str, Any] | None,
-    control_type: str,
-) -> None:
-    # LLM이 방향/강도 규칙을 흔들리게 반환하면 실험 정책 범위 안으로 보정한다.
-    if control_type not in ("LLM", "Rule"):
-        return
-
-    local_direction = _clear_adjustment_direction_from_text(voice_text)
-    action = str(response.get("action", "unknown"))
-    direction = str(response.get("direction", "unclear")).lower()
-
-    explicit_reject = _has_any(_normalize(voice_text), REJECT_KEYWORDS)
-    if (
-        action in ("ask_clarification", "unknown")
-        or (action == "reject" and local_direction and not explicit_reject)
-    ) and local_direction:
-        try:
-            confidence = float(response.get("confidence", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            confidence = 0.0
-        response.update(
-            {
-                "action": "adjust",
-                "direction": local_direction,
-                "is_invalid": False,
-                "clarification_question": "",
-                "confidence": max(confidence, 0.80),
-                "reason": _append_reason(
-                    str(response.get("reason", "")),
-                    "명확한 올림/내림 방향이 있어 조정 의도로 해석했습니다.",
-                ),
-            }
-        )
-        action = "adjust"
-        direction = local_direction
-    elif action == "adjust" and direction not in ("up", "down") and local_direction:
-        response["direction"] = local_direction
-        direction = local_direction
-
-    if control_type != "LLM" or action != "adjust" or direction not in ("up", "down"):
-        return
-
-    target_range = _llm_worker_allowed_target_range(voice_text, metadata, direction)
-    if target_range is None:
-        return
-
-    lower, upper, default_target, strength = target_range
-    guarded_target = max(lower, min(upper, default_target))
-    try:
-        target = float(response["target_shoulder_angle_deg"])
-        target_missing = False
-    except (KeyError, TypeError, ValueError):
-        target = guarded_target
-        target_missing = True
-
-    target_out_of_policy = abs(target - guarded_target) > 1e-6
-    if target_missing or target_out_of_policy:
-        response["target_shoulder_angle_deg"] = guarded_target
-        response["reason"] = _append_reason(
-            str(response.get("reason", "")),
-            f"Worker+LLM {strength} {direction} safe-range policy applied.",
-        )
-
-
-def _llm_worker_allowed_target_range(
-    voice_text: str,
-    metadata: dict[str, Any] | None,
-    direction: str,
-) -> tuple[float, float, float, str] | None:
-    if not isinstance(metadata, dict):
-        return None
-
-    try:
-        current_angle = float(metadata["cycle_representative_shoulder_angle_deg"])
-    except (KeyError, TypeError, ValueError):
-        return None
-
-    bounds = _llm_safe_target_bounds(metadata)
-    if bounds is None:
-        return None
-    lower, upper = bounds
-    strength = _adjustment_strength_from_text(voice_text)
-
-    if bool(metadata.get("cycle_is_risky", False)):
-        return lower, upper, _llm_default_safe_target(metadata), strength
-
-    baseline = max(lower, min(upper, current_angle))
-    ratio = _llm_adjustment_ratio_for_strength(strength)
-    if direction == "up":
-        return lower, upper, baseline + ((upper - baseline) * ratio), strength
-    if direction == "down":
-        return lower, upper, baseline - ((baseline - lower) * ratio), strength
-    return None
-
-
+# LLM target이 허용되는 개인별 안전 어깨각 범위를 계산한다.
 def _llm_safe_target_bounds(metadata: dict[str, Any]) -> tuple[float, float] | None:
     try:
         lower = float(metadata["effective_min_shoulder_deg"])
@@ -656,74 +451,7 @@ def _llm_safe_target_bounds(metadata: dict[str, Any]) -> tuple[float, float] | N
     return lower, upper
 
 
-def _llm_default_safe_target(metadata: dict[str, Any]) -> float:
-    bounds = _llm_safe_target_bounds(metadata)
-    if bounds is None:
-        return LLM_DEFAULT_SAFE_TARGET_DEG
-    lower, upper = bounds
-    try:
-        default_target = float(metadata.get("llm_default_safe_target_deg", LLM_DEFAULT_SAFE_TARGET_DEG))
-    except (TypeError, ValueError):
-        default_target = LLM_DEFAULT_SAFE_TARGET_DEG
-    if lower > LLM_DEFAULT_SAFE_TARGET_DEG + LLM_SAFE_TARGET_UPPER_BUFFER_DEG:
-        default_target = lower
-    return max(lower, min(upper, default_target))
-
-
-def _adjustment_strength_from_text(voice_text: str) -> str:
-    normalized = _normalize(voice_text)
-    if _has_any(normalized, SMALL_ADJUSTMENT_HINTS):
-        return "small"
-    if _has_any(normalized, STRONG_ADJUSTMENT_HINTS):
-        return "strong"
-    return "normal"
-
-
-def _llm_adjustment_ratio_for_strength(strength: str) -> float:
-    if strength == "small":
-        return LLM_SMALL_ADJUSTMENT_RATIO
-    if strength == "strong":
-        return LLM_STRONG_ADJUSTMENT_RATIO
-    return LLM_NORMAL_ADJUSTMENT_RATIO
-
-
-def _clear_adjustment_direction_from_text(voice_text: str) -> str | None:
-    normalized = _normalize(voice_text)
-    if not normalized:
-        return None
-
-    request_like = _has_any(normalized, ADJUSTMENT_REQUEST_HINTS)
-    direction_ending = any(
-        normalized.endswith(_normalize(keyword))
-        for keyword in (*UPWARD_ADJUST_KEYWORDS, *DOWNWARD_ADJUST_KEYWORDS)
-    )
-    if not request_like and not direction_ending:
-        return None
-
-    matches: list[tuple[int, str]] = []
-    for keyword in UPWARD_ADJUST_KEYWORDS:
-        idx = normalized.rfind(_normalize(keyword))
-        if idx >= 0:
-            matches.append((idx, "up"))
-    for keyword in DOWNWARD_ADJUST_KEYWORDS:
-        idx = normalized.rfind(_normalize(keyword))
-        if idx >= 0:
-            matches.append((idx, "down"))
-
-    if not matches:
-        return None
-    return max(matches, key=lambda item: item[0])[1]
-
-
-def _append_reason(existing: str, extra: str) -> str:
-    existing = existing.strip()
-    if not existing:
-        return extra
-    if extra in existing:
-        return existing
-    return f"{existing} {extra}"
-
-
+# Rule 조건에서 LLM target과 현재 대표각 차이로 방향만 추론한다.
 def resolve_rule_worker_target_angle_by_policy(
     metadata: dict[str, Any] | None,
     direction: str,
@@ -743,6 +471,7 @@ def resolve_rule_worker_target_angle_by_policy(
     return None
 
 
+# Worker+Rule 응답을 최종 Rule 정책 응답으로 변환한다.
 def _apply_rule_worker_policy(
     response: dict[str, Any],
     metadata: dict[str, Any] | None,
@@ -795,6 +524,7 @@ def _apply_rule_worker_policy(
     return response
 
 
+# LLM target과 현재 대표각을 비교해 up/down 방향을 추정한다.
 def _llm_adjustment_direction(
     response: dict[str, Any],
     metadata: dict[str, Any] | None,
@@ -820,6 +550,104 @@ def _llm_adjustment_direction(
     return None
 
 
+def _compact_utterance_text(voice_text: str) -> str:
+    return re.sub(r"\s+", "", (voice_text or "").lower())
+
+
+def _utterance_has_small_step_cue(voice_text: str) -> bool:
+    text = _compact_utterance_text(voice_text)
+    return bool(re.search(r"(조금|살짝|약간)", text))
+
+
+def _should_retry_llm_after_validation_failure(retry_reason: str) -> bool:
+    return retry_reason in {
+        "Small-step target did not match the LLM target policy.",
+    }
+
+
+def _should_retry_llm_clarification(
+    response: dict[str, Any],
+    metadata: dict[str, Any] | None,
+) -> bool:
+    if str(response.get("action", "unknown")) != "ask_clarification":
+        return False
+    if not isinstance(metadata, dict):
+        return False
+    try:
+        current_robot_angle = float(metadata["current_robot_shoulder_angle_deg"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    bounds = _llm_safe_target_bounds(metadata)
+    if bounds is None:
+        return False
+    safe_lower, safe_upper = bounds
+    tolerance_deg = RULE_MIN_ANGLE_TOLERANCE_DEG
+    return (
+        current_robot_angle <= safe_lower + tolerance_deg
+        or current_robot_angle >= safe_upper - tolerance_deg
+    )
+
+
+def _metadata_with_validation_feedback(
+    metadata: dict[str, Any] | None,
+    retry_reason: str,
+    response: dict[str, Any],
+) -> dict[str, Any]:
+    retry_metadata = dict(metadata or {})
+    feedback: dict[str, Any] = {
+        "reason": retry_reason,
+        "previous_response": {
+            "action": response.get("action"),
+            "direction": response.get("direction"),
+            "target_shoulder_angle_deg": response.get("target_shoulder_angle_deg"),
+            "confidence": response.get("confidence"),
+        },
+        "instruction": "Return a corrected JSON object that satisfies this validation feedback.",
+    }
+
+    if retry_reason == "Small-step target did not match the LLM target policy.":
+        direction = str(response.get("direction", "")).lower()
+        policy_key = f"small_{direction}_target_deg"
+        target_policy = retry_metadata.get("llm_target_policy", {})
+        if isinstance(target_policy, dict) and policy_key in target_policy:
+            feedback.update(
+                {
+                    "required_target_policy_key": policy_key,
+                    "required_target_shoulder_angle_deg": target_policy[policy_key],
+                    "instruction": (
+                        "The utterance is a small-step adjustment. Use the required "
+                        "llm_target_policy value exactly as target_shoulder_angle_deg."
+                    ),
+                }
+            )
+
+    if retry_reason == "Clarification response should be semantically re-evaluated.":
+        feedback.update(
+            {
+                "instruction": (
+                    "The previous response was ask_clarification. Re-evaluate the "
+                    "whole utterance semantically. If it clearly asks to move higher "
+                    "or lower, return action=adjust with the requested direction and "
+                    "the matching llm_target_policy boundary/strength target. Keep "
+                    "ask_clarification only if the utterance is truly directionless."
+                ),
+            }
+        )
+
+    retry_metadata["validation_feedback"] = feedback
+    return retry_metadata
+
+
+def _limit_action_from_retry_reason(retry_reason: str) -> str | None:
+    if retry_reason in {
+        "Downward intent was requested at or below the safe lower bound.",
+        "Upward intent was requested at or above the safe upper bound.",
+    }:
+        return "limit_reached"
+    return None
+
+
+# LLM 응답이 적용 가능한지 confidence, 방향, 안전 범위 기준으로 검증한다.
 def _llm_worker_retry_reason(
     voice_text: str,
     response: dict[str, Any],
@@ -827,6 +655,7 @@ def _llm_worker_retry_reason(
     validate_target: bool = True,
 ) -> str:
     action = str(response.get("action", "unknown"))
+
     if action not in ("approve", "reject", "adjust"):
         return ""
 
@@ -873,11 +702,27 @@ def _llm_worker_retry_reason(
             safe_lower, safe_upper = bounds
             if target_angle < safe_lower - tolerance_deg or target_angle > safe_upper + tolerance_deg:
                 return "LLM target angle is outside the safe 60-80 policy range."
+            if direction == "down" and current_robot_angle <= safe_lower + tolerance_deg:
+                return "Downward intent was requested at or below the safe lower bound."
+            if direction == "up" and current_robot_angle >= safe_upper - tolerance_deg:
+                return "Upward intent was requested at or above the safe upper bound."
+            safe_baseline = max(safe_lower, min(safe_upper, current_robot_angle))
+            if _utterance_has_small_step_cue(voice_text):
+                target_policy = (metadata or {}).get("llm_target_policy", {})
+                policy_key = f"small_{direction}_target_deg"
+                try:
+                    expected_target = float(target_policy[policy_key])
+                except (KeyError, TypeError, ValueError):
+                    expected_target = None
+                if expected_target is not None:
+                    if abs(target_angle - expected_target) > tolerance_deg:
+                        return "Small-step target did not match the LLM target policy."
+                elif abs(target_angle - safe_baseline) > SMALL_STEP_MAX_DELTA_DEG + tolerance_deg:
+                    return "Small-step utterance produced an unexpectedly large target change."
             if not bool((metadata or {}).get("cycle_is_risky", False)):
-                baseline = max(safe_lower, min(safe_upper, current_worker_angle))
-                if direction == "up" and target_angle < baseline - tolerance_deg:
+                if direction == "up" and target_angle < safe_baseline - tolerance_deg:
                     return "Upward intent produced a target below the safe-range baseline."
-                if direction == "down" and target_angle > baseline + tolerance_deg:
+                if direction == "down" and target_angle > safe_baseline + tolerance_deg:
                     return "Downward intent produced a target above the safe-range baseline."
         else:
             at_lower_limit = current_robot_angle <= effective_min + tolerance_deg
@@ -889,97 +734,21 @@ def _llm_worker_retry_reason(
                 if not (at_lower_limit and target_angle <= current_worker_angle + tolerance_deg):
                     return "Downward intent produced a non-downward target angle."
 
-    normalized = _normalize(voice_text)
-    if _is_directionless_confirmation(normalized):
-        return "Directionless confirmation should be clarified before changing height."
-
-    if _is_directionless_adjustment_request(normalized):
-        return "Directionless adjustment request should be clarified before changing height."
-
-    if _is_ambiguous_asr_phrase(normalized):
-        return "Ambiguous ASR-like phrase lacks a clear height/posture intent."
-
     return ""
 
 
-def _is_directionless_confirmation(normalized: str) -> bool:
-    return any(normalized == _normalize(phrase) for phrase in DIRECTIONLESS_CONFIRMATION_PHRASES)
-
-
-def _is_directionless_modifier(normalized: str) -> bool:
-    return any(normalized == _normalize(phrase) for phrase in DIRECTIONLESS_MODIFIER_PHRASES)
-
-
-def _is_directionless_adjustment_request(normalized: str) -> bool:
-    if not _has_any(normalized, DIRECTIONLESS_ADJUSTMENT_HINTS):
-        return False
-    return not _has_any(normalized, DIRECTION_OR_MAINTAIN_HINTS)
-
-
-def _is_ambiguous_asr_phrase(normalized: str) -> bool:
-    if not _has_any(normalized, AMBIGUOUS_ASR_PHRASES):
-        return False
-    return not _has_any(normalized, HEIGHT_POSTURE_HINTS)
-
-
-def _is_tts_echo(text: str) -> bool:
-    return _has_any(_normalize(text), IGNORED_TTS_ECHO_PHRASES)
-
-
-def _normalize(text: str) -> str:
-    # 키워드 매칭을 위해 소문자화하고 공백을 제거한다.
-    return text.lower().replace(" ", "")
-
-
-def _has_any(normalized: str, keywords: tuple[str, ...]) -> bool:
-    # 정규화된 문장에 키워드 중 하나라도 포함되는지 확인한다.
-    return any(keyword.lower().replace(" ", "") in normalized for keyword in keywords)
-
-
-class RuleIntentParser:
-    # 명확한 키워드만 LLM 없이 빠르게 완료/승인/거절로 분류한다.
-    def parse(self, text: str | None, context: str = "any") -> str:
-        # 한 문장을 rule 기반으로 complete/approve/reject/unknown 중 하나로 해석한다.
-        normalized = _normalize(text or "")
-        if not normalized:
-            return "unknown"
-
-        if context == "task_completion" and _has_any(normalized, TASK_COMPLETION_KEYWORDS):
-            return "complete"
-
-        if context == "adjustment_response" and _has_any(normalized, REJECT_KEYWORDS):
-            return "reject"
-
-        if context == "adjustment_response" and _has_any(normalized, UPWARD_ADJUST_KEYWORDS):
-            return "adjust_up"
-
-        if context == "adjustment_response" and _has_any(normalized, DOWNWARD_ADJUST_KEYWORDS):
-            return "adjust_down"
-
-        if context == "adjustment_response" and _has_any(normalized, APPROVE_KEYWORDS):
-            return "ask_clarification"
-
-        if context == "any" and _has_any(normalized, TASK_COMPLETION_KEYWORDS):
-            return "complete"
-
-        if context == "any" and _has_any(normalized, REJECT_KEYWORDS):
-            return "reject"
-
-        if context == "any" and _has_any(normalized, APPROVE_KEYWORDS):
-            return "approve"
-
-        return "unknown"
-
-
+# OpenAI 호환 Chat Completion API로 발화를 구조화된 의도 결과로 파싱한다.
 class LlmIntentParser:
     # LLM으로 작업자 의도와 상태를 해석해 조정 여부와 목표 어깨각을 구조화해서 받는다.
+    # LLM 클라이언트, 모델, 프롬프트 경로를 초기화한다.
     def __init__(
         self,
         api_key: str,
         base_url: str | None = None,
-        model: str = "llama-3.1-8b-instant",
+        model: str = "llama-3.3-70b-versatile",
         system_prompt_path: str | Path = DEFAULT_SYSTEM_PROMPT_PATH,
         temperature: float = 0.0,
+        response_log_path: str | Path | None = DEFAULT_LLM_RESPONSE_LOG_PATH,
     ) -> None:
         from openai import OpenAI
 
@@ -987,7 +756,11 @@ class LlmIntentParser:
         self.model = model
         self.temperature = temperature
         self.system_prompt_path = Path(system_prompt_path)
+        self.response_log_path = Path(response_log_path) if response_log_path else None
+        self.last_latency_s = 0.0
+        self.last_response_record: dict[str, Any] | None = None
 
+    # 발화와 metadata를 LLM에 보내고 구조화된 의도 결과를 반환한다.
     def parse(
         self,
         text: str | None,
@@ -995,15 +768,30 @@ class LlmIntentParser:
         metadata: dict[str, Any] | None = None,
     ) -> LlmAdjustmentDecision:
         # 발화와 context를 LLM에 보내고 LlmAdjustmentDecision으로 변환한다.
+        started_at = time.time()
+        self.last_latency_s = 0.0
+        self.last_response_record = None
         raw_text = text or ""
         system_prompt = self.system_prompt_path.read_text(encoding="utf-8")
         user_content = self._build_user_content(raw_text, context, metadata)
+        content = ""
 
         try:
             response = self._create_completion(system_prompt, user_content)
             content = response.choices[0].message.content or "{}"
             parsed = json.loads(content.strip())
-            return self._result_from_json(parsed, raw_text)
+            decision = self._result_from_json(parsed, raw_text, content)
+            self.last_latency_s = time.time() - started_at
+            self._write_response_log(
+                context=context,
+                raw_text=raw_text,
+                metadata=metadata,
+                user_content=user_content,
+                raw_response_text=content,
+                parsed_response=parsed,
+                decision=decision,
+            )
+            return decision
         except Exception as exc:
             if "json_validate_failed" in str(exc):
                 try:
@@ -1016,16 +804,42 @@ class LlmIntentParser:
                     response = self._create_completion(repair_prompt, user_content)
                     content = response.choices[0].message.content or "{}"
                     parsed = json.loads(content.strip())
-                    return self._result_from_json(parsed, raw_text)
+                    decision = self._result_from_json(parsed, raw_text, content)
+                    self.last_latency_s = time.time() - started_at
+                    self._write_response_log(
+                        context=context,
+                        raw_text=raw_text,
+                        metadata=metadata,
+                        user_content=user_content,
+                        raw_response_text=content,
+                        parsed_response=parsed,
+                        decision=decision,
+                        repaired=True,
+                    )
+                    return decision
                 except Exception as retry_exc:
                     exc = retry_exc
-            return LlmAdjustmentDecision(
+            decision = LlmAdjustmentDecision(
                 raw_text=raw_text,
+                raw_response_text=content,
                 source="llm_error",
                 is_invalid=True,
                 reason=f"LLM intent parsing failed: {exc}",
             )
+            self.last_latency_s = time.time() - started_at
+            self._write_response_log(
+                context=context,
+                raw_text=raw_text,
+                metadata=metadata,
+                user_content=user_content,
+                raw_response_text=content,
+                parsed_response=None,
+                decision=decision,
+                error=str(exc),
+            )
+            return decision
 
+    # OpenAI 호환 chat completion 요청을 실행한다.
     def _create_completion(self, system_prompt: str, user_content: str):
         return self.client.chat.completions.create(
             model=self.model,
@@ -1038,6 +852,45 @@ class LlmIntentParser:
             response_format={"type": "json_object"},
         )
 
+    # LLM 원문 응답과 파싱된 decision을 jsonl 로그 파일에 저장한다.
+    def _write_response_log(
+        self,
+        context: str,
+        raw_text: str,
+        metadata: dict[str, Any] | None,
+        user_content: str,
+        raw_response_text: str,
+        parsed_response: dict[str, Any] | None,
+        decision: LlmAdjustmentDecision,
+        repaired: bool = False,
+        error: str | None = None,
+    ) -> None:
+        record = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "model": self.model,
+            "latency_s": self.last_latency_s,
+            "context": context,
+            "utterance": raw_text,
+            "metadata": metadata or {},
+            "user_content": user_content,
+            "raw_response_text": raw_response_text,
+            "parsed_response": parsed_response,
+            "decision": decision.to_dict(),
+            "repaired": repaired,
+            "error": error,
+        }
+        self.last_response_record = record
+
+        if self.response_log_path is None:
+            return
+        try:
+            self.response_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.response_log_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            print(f"[LLM LOG ERROR] {exc}")
+
+    # LLM에 전달할 user message JSON을 구성한다.
     def _build_user_content(
         self,
         text: str,
@@ -1053,10 +906,19 @@ class LlmIntentParser:
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     @staticmethod
-    def _result_from_json(parsed: dict[str, Any], raw_text: str) -> LlmAdjustmentDecision:
+    # LLM JSON 응답을 LlmAdjustmentDecision 객체로 변환한다.
+    def _result_from_json(
+        parsed: dict[str, Any],
+        raw_text: str,
+        raw_response_text: str = "",
+    ) -> LlmAdjustmentDecision:
         # LLM이 반환한 JSON dict에서 action과 목표 어깨각만 main에서 쓰기 쉽게 꺼낸다.
+        action = str(parsed.get("action", "unknown"))
+        clarification_question = ""
+        if action == "ask_clarification":
+            clarification_question = WORKER_ADJUSTMENT_CLARIFICATION_QUESTION
         return LlmAdjustmentDecision(
-            action=str(parsed.get("action", "unknown")),
+            action=action,
             direction=str(parsed.get("direction", "unclear")).lower(),
             target_shoulder_angle_deg=LlmIntentParser._optional_float(
                 parsed.get("target_shoulder_angle_deg")
@@ -1065,12 +927,14 @@ class LlmIntentParser:
             ),
             confidence=float(parsed.get("confidence", 0.0) or 0.0),
             is_invalid=bool(parsed.get("is_invalid", False)),
-            clarification_question=str(parsed.get("clarification_question", "")),
+            clarification_question=clarification_question,
             reason=str(parsed.get("reason", "")),
             raw_text=raw_text,
+            raw_response_text=raw_response_text,
         )
 
     @staticmethod
+    # None이나 문자열 숫자를 안전하게 float 또는 None으로 변환한다.
     def _optional_float(value: Any) -> float | None:
         # LLM이 숫자를 문자열로 줘도 목표 어깨각으로 쓸 수 있게 float로 변환한다.
         if value is None or value == "":

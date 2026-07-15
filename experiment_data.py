@@ -505,8 +505,11 @@ class ExperimentDataLogger:
         )
 
         self.pass_goal_dir = os.path.join(result_dir, "pass_goal_json", self.run_id)
+        self.llm_response_dir = os.path.join(result_dir, "llm_response_json", self.run_id)
         os.makedirs(self.pass_goal_dir, exist_ok=True)
+        os.makedirs(self.llm_response_dir, exist_ok=True)
         self._pass_goal_json_index = 0
+        self._llm_response_json_index = 0
 
     def write_trial(self, record: TrialRecord) -> None:
         self._append_row(self.raw_path, self.RAW_HEADER, self._trial_to_row(record))
@@ -524,6 +527,19 @@ class ExperimentDataLogger:
         safe_label = _safe_filename_part(label)
         filename = f"{timestamp}_{self._pass_goal_json_index:03d}_{safe_label}.json"
         path = os.path.join(self.pass_goal_dir, filename)
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+        return path
+
+    def write_llm_response_json(self, payload: dict[str, Any], label: str) -> str:
+        self._llm_response_json_index += 1
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        safe_label = _safe_filename_part(label)
+        filename = f"{timestamp}_{self._llm_response_json_index:03d}_{safe_label}.json"
+        path = os.path.join(self.llm_response_dir, filename)
 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
