@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -56,6 +57,7 @@ class TrialRecord:
     drill_tcp_offset_cm: float
     cycle: CycleResult
     target_shoulder_angle_deg: float | None
+    target_angle_clamped: bool
     angle_adjustment_deg: float | None
     target_angle_source: str
     response_action: str
@@ -87,34 +89,45 @@ class SummaryRecord:
     """summary CSV 한 줄에 저장할 실험 실행 단위 요약."""
 
     condition_name: str
-    completed_transfers: int
-    measured_side: str
-    experiment_duration_s: float
-    avg_cycle_task_time_s: float
-    risky_time_s: float
+    avg_representative_shoulder_angle_deg: float
+    avg_shoulder_flexion_angle_deg: float
+    avg_elbow_angle_deg: float
+    risky_posture_time_s: float
+    risky_posture_ratio_total: float
     risky_cycle_count: int
     risky_cycle_ratio_total: float
+    visibility_ok_ratio_total: float
+    avg_rula_proxy: float
+    safe_posture_attainment_rate: float | None
+    avg_post_adjustment_shoulder_improvement_deg: float | None
+    risk_recurrence_rate: float | None
+    completed_transfers: int
+    avg_cycle_task_time_s: float
+    task_time_sd_s: float
+    throughput_transfers_per_min: float
+    early_stop_flag: int
     system_interventions: int
+    worker_requested_adjustment_count: int
     adjust_count: int
-    avg_adj_mm: float
+    avg_adjustment_per_cycle_mm: float
+    avg_adjustment_per_adjustment_mm: float
+    total_adjustment_magnitude_mm: float
     correction_cmds: int
+    direction_reversal_count: int
+    avg_adjustments_to_safe_posture: float | None
     invalid_cmds: int
     worker_approve_count: int
     worker_reject_count: int
+    worker_approval_rate: float
+    worker_rejection_rate: float
     llm_call_count: int
-    llm_fallback_count: int
     avg_llm_latency_s: float
-    avg_representative_shoulder_angle_deg: float
-    avg_shoulder_angle_deg: float
-    avg_rula_proxy: float
-    risk_shoulder_threshold_deg: float
-    risky_cycle_ratio_threshold: float
-    user_height_cm: float
-    shoulder_height_cm: float
-    upper_arm_cm: float
-    forearm_cm: float
-    drill_tcp_offset_cm: float
-    early_stop_flag: int
+    llm_fallback_rate: float
+    avg_command_to_action_latency_s: float | None
+    avg_adjustment_completion_time_s: float | None
+    robot_target_reach_success_rate: float | None
+    avg_target_height_error_mm: float | None
+    height_limit_hit_rate: float
 
 
 class ExperimentMetrics:
@@ -143,11 +156,18 @@ class ExperimentMetrics:
         self.llm_call_count = 0
         self.llm_fallback_count = 0
         self.early_stop_flag = 0
+        self.worker_requested_adjustment_count = 0
+        self.direction_reversal_count = 0
+        self.height_limit_hit_count = 0
+        self.total_task_time_s = 0.0
+        self.total_visibility_ok_time_s = 0.0
+        self._last_adjustment_direction = 0
 
         self.llm_latencies: list[float] = []
         self.cycle_durations: list[float] = []
         self.cycle_representative_shoulder_angles: list[float] = []
         self.cycle_avg_shoulder_angles: list[float] = []
+        self.cycle_avg_elbow_angles: list[float] = []
         self.cycle_avg_rula_scores: list[float] = []
 
         self.start_cycle()
@@ -218,20 +238,36 @@ class ExperimentMetrics:
         adjustment_z_mm: float,
         is_invalid: bool,
         is_correction: bool,
+        pose_height_clamped: bool = False,
+        target_angle_clamped: bool = False,
+        is_worker_requested_adjustment: bool = False,
     ) -> None:
         """trial 확정 후 summary용 누적 지표를 갱신한다."""
         self.completed_transfers += 1
         self.risky_posture_time_s += cycle.risky_time_s
+        self.total_task_time_s += cycle.task_time_s
+        self.total_visibility_ok_time_s += cycle.visibility_ok_time_s
         self.cycle_durations.append(cycle.task_time_s)
         self.cycle_representative_shoulder_angles.append(cycle.representative_shoulder_angle_deg)
         self.cycle_avg_shoulder_angles.append(cycle.avg_shoulder_angle_deg)
+        self.cycle_avg_elbow_angles.append(cycle.avg_elbow_angle_deg)
         self.cycle_avg_rula_scores.append(cycle.avg_rula_proxy)
 
         if cycle.is_risky_cycle:
             self.risky_cycle_count += 1
-        if abs(adjustment_z_mm) > 10.0:
+        adjustment_magnitude_mm = abs(adjustment_z_mm)
+        is_adjusted = adjustment_magnitude_mm > 10.0
+        if is_adjusted:
             self.robot_adjustment_count += 1
-        self.total_adjustment_magnitude_mm += abs(adjustment_z_mm)
+            adjustment_direction = 1 if adjustment_z_mm > 0 else -1
+            if self._last_adjustment_direction and adjustment_direction != self._last_adjustment_direction:
+                self.direction_reversal_count += 1
+            self._last_adjustment_direction = adjustment_direction
+        if is_worker_requested_adjustment and is_adjusted:
+            self.worker_requested_adjustment_count += 1
+        if pose_height_clamped or target_angle_clamped:
+            self.height_limit_hit_count += 1
+        self.total_adjustment_magnitude_mm += adjustment_magnitude_mm
         if is_invalid:
             self.invalid_cmds += 1
         if is_correction:
@@ -292,37 +328,79 @@ class ExperimentMetrics:
             if self.cycle_avg_rula_scores
             else 0.0
         )
+        avg_elbow = (
+            sum(self.cycle_avg_elbow_angles) / len(self.cycle_avg_elbow_angles)
+            if self.cycle_avg_elbow_angles
+            else 0.0
+        )
+        task_time_sd = _population_sd(self.cycle_durations)
+        throughput_transfers_per_min = (
+            completed / self.total_task_time_s * 60.0
+            if self.total_task_time_s > 0
+            else 0.0
+        )
+        risky_posture_ratio_total = (
+            self.risky_posture_time_s / self.total_visibility_ok_time_s
+            if self.total_visibility_ok_time_s > 0
+            else 0.0
+        )
+        visibility_ok_ratio_total = (
+            self.total_visibility_ok_time_s / self.total_task_time_s
+            if self.total_task_time_s > 0
+            else 0.0
+        )
+        avg_adjustment_per_adjustment = (
+            self.total_adjustment_magnitude_mm / self.robot_adjustment_count
+            if self.robot_adjustment_count > 0
+            else 0.0
+        )
+        worker_response_total = self.worker_approve_count + self.worker_reject_count
+        worker_approval_rate = self.worker_approve_count / worker_response_total if worker_response_total > 0 else 0.0
+        worker_rejection_rate = self.worker_reject_count / worker_response_total if worker_response_total > 0 else 0.0
+        llm_fallback_rate = self.llm_fallback_count / self.llm_call_count if self.llm_call_count > 0 else 0.0
+        height_limit_hit_rate = self.height_limit_hit_count / completed if completed > 0 else 0.0
 
         return SummaryRecord(
             condition_name=condition_name,
-            completed_transfers=completed,
-            measured_side=measured_side,
-            experiment_duration_s=experiment_duration_s,
-            avg_cycle_task_time_s=avg_cycle_time,
-            risky_time_s=self.risky_posture_time_s,
+            avg_representative_shoulder_angle_deg=avg_representative_shoulder,
+            avg_shoulder_flexion_angle_deg=avg_shoulder,
+            avg_elbow_angle_deg=avg_elbow,
+            risky_posture_time_s=self.risky_posture_time_s,
+            risky_posture_ratio_total=risky_posture_ratio_total,
             risky_cycle_count=self.risky_cycle_count,
             risky_cycle_ratio_total=risky_cycle_ratio_total,
+            visibility_ok_ratio_total=visibility_ok_ratio_total,
+            avg_rula_proxy=avg_rula,
+            safe_posture_attainment_rate=None,
+            avg_post_adjustment_shoulder_improvement_deg=None,
+            risk_recurrence_rate=None,
+            completed_transfers=completed,
+            avg_cycle_task_time_s=avg_cycle_time,
+            task_time_sd_s=task_time_sd,
+            throughput_transfers_per_min=throughput_transfers_per_min,
+            early_stop_flag=self.early_stop_flag,
             system_interventions=self.system_intervention_count,
+            worker_requested_adjustment_count=self.worker_requested_adjustment_count,
             adjust_count=self.robot_adjustment_count,
-            avg_adj_mm=avg_adj_mm,
+            avg_adjustment_per_cycle_mm=avg_adj_mm,
+            avg_adjustment_per_adjustment_mm=avg_adjustment_per_adjustment,
+            total_adjustment_magnitude_mm=self.total_adjustment_magnitude_mm,
             correction_cmds=self.correction_commands_count,
+            direction_reversal_count=self.direction_reversal_count,
+            avg_adjustments_to_safe_posture=None,
             invalid_cmds=self.invalid_cmds,
             worker_approve_count=self.worker_approve_count,
             worker_reject_count=self.worker_reject_count,
+            worker_approval_rate=worker_approval_rate,
+            worker_rejection_rate=worker_rejection_rate,
             llm_call_count=self.llm_call_count,
-            llm_fallback_count=self.llm_fallback_count,
             avg_llm_latency_s=avg_llm_latency,
-            avg_representative_shoulder_angle_deg=avg_representative_shoulder,
-            avg_shoulder_angle_deg=avg_shoulder,
-            avg_rula_proxy=avg_rula,
-            risk_shoulder_threshold_deg=self.risk_shoulder_deg,
-            risky_cycle_ratio_threshold=self.risky_cycle_ratio_threshold,
-            user_height_cm=user_height_cm,
-            shoulder_height_cm=shoulder_height_cm,
-            upper_arm_cm=upper_arm_cm,
-            forearm_cm=forearm_cm,
-            drill_tcp_offset_cm=drill_tcp_offset_cm,
-            early_stop_flag=self.early_stop_flag,
+            llm_fallback_rate=llm_fallback_rate,
+            avg_command_to_action_latency_s=None,
+            avg_adjustment_completion_time_s=None,
+            robot_target_reach_success_rate=None,
+            avg_target_height_error_mm=None,
+            height_limit_hit_rate=height_limit_hit_rate,
         )
 
 
@@ -343,7 +421,7 @@ class ExperimentDataLogger:
         "Representative_Shoulder_Angle_deg", "Avg_Shoulder_Angle_deg", "Avg_Elbow_Angle_deg",
         "Avg_RULA_Proxy", "Max_RULA_Proxy", "RULA_High_Ratio",
         # 의사결정 결과
-        "Target_Shoulder_Angle_deg", "Angle_Adjustment_deg", "Target_Angle_Source",
+        "Target_Shoulder_Angle_deg", "Target_Angle_Clamped", "Angle_Adjustment_deg", "Target_Angle_Source",
         "Response_Action", "Response_Source", "LLM_Confidence", "Decision_Reason", "LLM_Fallback",
         # 로봇 목표와 전송 결과
         "Prev_Z_mm", "Final_Z_mm", "Adjustment_Z_mm", "User_Voice", "Final_Z_m",
@@ -353,24 +431,60 @@ class ExperimentDataLogger:
     ]
 
     # summary CSV는 실험 조건 1회 실행이 끝났을 때 한 줄 저장한다.
-    SUMMARY_HEADER = [
         # 실행 조건
-        "Condition", "Completed_Transfers", "Measured_Side",
         # 시간/위험 요약
-        "Experiment_Duration_s", "Avg_Cycle_Task_Time_s",
-        "Risky_Time_s", "Risky_Cycle_Count", "Risky_Cycle_Ratio_Total",
         # 개입/명령 요약
-        "System_Interventions", "Adjust_Count", "Avg_Adj_mm", "Correction_Cmds", "Invalid_Cmds",
         # 작업자/LLM 응답 요약
-        "Worker_Approve_Count", "Worker_Reject_Count",
-        "LLM_Call_Count", "LLM_Fallback_Count", "Avg_LLM_Latency_s",
         # 자세 요약
-        "Avg_Representative_Shoulder_Angle_deg", "Avg_Shoulder_Angle_deg", "Avg_RULA_Proxy",
         # 분석 기준값과 피험자 치수
-        "Risk_Shoulder_Threshold_deg", "Risky_Cycle_Ratio_Threshold",
-        "User_Height_cm", "Shoulder_Height_cm", "Upper_Arm_cm", "Forearm_cm", "Drill_TCP_Offset_cm",
         # 종료 상태
+
+    SUMMARY_CATEGORY_HEADER = (
+        ["Posture-based Indicators"] * 12
+        + ["Performance"] * 5
+        + ["Robot Control"] * 22
+    )
+
+    SUMMARY_HEADER = [
+        "Avg_Representative_Shoulder_Angle_deg",
+        "Avg_Shoulder_Flexion_Angle_deg",
+        "Avg_Elbow_Angle_deg",
+        "Risky_Posture_Time_s",
+        "Risky_Posture_Ratio_Total",
+        "Risky_Cycle_Count",
+        "Risky_Cycle_Ratio_Total",
+        "Visibility_OK_Ratio_Total",
+        "Avg_RULA_Proxy",
+        "Safe_Posture_Attainment_Rate",
+        "Avg_Post_Adjustment_Shoulder_Improvement_deg",
+        "Risk_Recurrence_Rate",
+        "Completed_Transfers",
+        "Avg_Cycle_Task_Time_s",
+        "Task_Time_SD_s",
+        "Throughput_Transfers_Per_Min",
         "Early_Stop_Flag",
+        "System_Interventions",
+        "Worker_Requested_Adjustment_Count",
+        "Adjust_Count",
+        "Avg_Adjustment_Per_Cycle_mm",
+        "Avg_Adjustment_Per_Adjustment_mm",
+        "Total_Adjustment_Magnitude_mm",
+        "Correction_Cmds",
+        "Direction_Reversal_Count",
+        "Avg_Adjustments_To_Safe_Posture",
+        "Invalid_Cmds",
+        "Worker_Approve_Count",
+        "Worker_Reject_Count",
+        "Worker_Approval_Rate",
+        "Worker_Rejection_Rate",
+        "LLM_Call_Count",
+        "Avg_LLM_Latency_s",
+        "LLM_Fallback_Rate",
+        "Avg_Command_To_Action_Latency_s",
+        "Avg_Adjustment_Completion_Time_s",
+        "Robot_Target_Reach_Success_Rate",
+        "Avg_Target_Height_Error_mm",
+        "Height_Limit_Hit_Rate",
     ]
 
     def __init__(self, result_dir: str, run_label: str | None = None) -> None:
@@ -387,7 +501,7 @@ class ExperimentDataLogger:
         )
         self.summary_path = os.path.join(
             self.per_run_dir,
-            f"{self.run_id}_summary_matrix.csv",
+            f"{self.run_id}_condition_level_metrics.csv",
         )
 
         self.pass_goal_dir = os.path.join(result_dir, "pass_goal_json", self.run_id)
@@ -398,7 +512,11 @@ class ExperimentDataLogger:
         self._append_row(self.raw_path, self.RAW_HEADER, self._trial_to_row(record))
 
     def write_summary(self, record: SummaryRecord) -> None:
-        self._append_row(self.summary_path, self.SUMMARY_HEADER, self._summary_to_row(record))
+        self._append_row(
+            self.summary_path,
+            [self.SUMMARY_CATEGORY_HEADER, self.SUMMARY_HEADER],
+            self._summary_to_row(record),
+        )
 
     def write_pass_goal_json(self, payload: dict[str, Any], label: str) -> str:
         self._pass_goal_json_index += 1
@@ -413,12 +531,15 @@ class ExperimentDataLogger:
 
         return path
 
-    def _append_row(self, filename: str, header: list[str], row: list[Any]) -> None:
+    def _append_row(self, filename: str, header: list[str] | list[list[str]], row: list[Any]) -> None:
         header_needed = not os.path.isfile(filename) or os.path.getsize(filename) == 0
         with open(filename, "a", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
             if header_needed:
-                writer.writerow(header)
+                if header and isinstance(header[0], list):
+                    writer.writerows(header)
+                else:
+                    writer.writerow(header)
             writer.writerow(row)
 
     def _trial_to_row(self, record: TrialRecord) -> list[Any]:
@@ -450,6 +571,7 @@ class ExperimentDataLogger:
             _round(cycle.max_rula_proxy, 2),
             _round(cycle.rula_high_ratio, 3),
             _round(record.target_shoulder_angle_deg, 2),
+            record.target_angle_clamped,
             _round(record.angle_adjustment_deg, 2),
             record.target_angle_source,
             record.response_action,
@@ -478,36 +600,47 @@ class ExperimentDataLogger:
 
     def _summary_to_row(self, record: SummaryRecord) -> list[Any]:
         return [
-            record.condition_name,
-            record.completed_transfers,
-            record.measured_side,
-            _round(record.experiment_duration_s, 2),
-            _round(record.avg_cycle_task_time_s, 2),
-            _round(record.risky_time_s, 2),
+            _round(record.avg_representative_shoulder_angle_deg, 2),
+            _round(record.avg_shoulder_flexion_angle_deg, 2),
+            _round(record.avg_elbow_angle_deg, 2),
+            _round(record.risky_posture_time_s, 2),
+            _round(record.risky_posture_ratio_total, 3),
             record.risky_cycle_count,
             _round(record.risky_cycle_ratio_total, 3),
+            _round(record.visibility_ok_ratio_total, 3),
+            _round(record.avg_rula_proxy, 2),
+            _round(record.safe_posture_attainment_rate, 3),
+            _round(record.avg_post_adjustment_shoulder_improvement_deg, 2),
+            _round(record.risk_recurrence_rate, 3),
+            record.completed_transfers,
+            _round(record.avg_cycle_task_time_s, 2),
+            _round(record.task_time_sd_s, 2),
+            _round(record.throughput_transfers_per_min, 2),
+            record.early_stop_flag,
             record.system_interventions,
+            record.worker_requested_adjustment_count,
             record.adjust_count,
-            _round(record.avg_adj_mm, 1),
+            _round(record.avg_adjustment_per_cycle_mm, 1),
+            _round(record.avg_adjustment_per_adjustment_mm, 1),
+            _round(record.total_adjustment_magnitude_mm, 1),
             record.correction_cmds,
+            record.direction_reversal_count,
+            _round(record.avg_adjustments_to_safe_posture, 2),
             record.invalid_cmds,
             record.worker_approve_count,
             record.worker_reject_count,
+            _round(record.worker_approval_rate, 3),
+            _round(record.worker_rejection_rate, 3),
             record.llm_call_count,
-            record.llm_fallback_count,
             _round(record.avg_llm_latency_s, 2),
-            _round(record.avg_representative_shoulder_angle_deg, 2),
-            _round(record.avg_shoulder_angle_deg, 2),
-            _round(record.avg_rula_proxy, 2),
-            record.risk_shoulder_threshold_deg,
-            record.risky_cycle_ratio_threshold,
-            _round(record.user_height_cm, 1),
-            _round(record.shoulder_height_cm, 1),
-            _round(record.upper_arm_cm, 1),
-            _round(record.forearm_cm, 1),
-            _round(record.drill_tcp_offset_cm, 1),
-            record.early_stop_flag,
+            _round(record.llm_fallback_rate, 3),
+            _round(record.avg_command_to_action_latency_s, 2),
+            _round(record.avg_adjustment_completion_time_s, 2),
+            _round(record.robot_target_reach_success_rate, 3),
+            _round(record.avg_target_height_error_mm, 1),
+            _round(record.height_limit_hit_rate, 3),
         ]
+
 
 def _mode_angle_by_bin(angles: list[float], bin_size_deg: float = 2.0, default: float = 0.0) -> float:
     """5도 단위로 묶어 가장 오래 머문 어깨각 구간의 대표값을 계산한다."""
@@ -521,6 +654,14 @@ def _mode_angle_by_bin(angles: list[float], bin_size_deg: float = 2.0, default: 
 
     mode_bin = max(bins.values(), key=len)
     return sum(mode_bin) / len(mode_bin)
+
+
+def _population_sd(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    return math.sqrt(variance)
 
 
 def _round(value: float | None, digits: int) -> float | str:

@@ -148,6 +148,10 @@ STRONG_ADJUSTMENT_HINTS = (
 ADJUSTMENT_REQUEST_HINTS = (
     "줘",
     "주세요",
+    "주라",
+    "줘라",
+    "해줘라",
+    "해주라",
     "줄래",
     "달라",
     "달라고",
@@ -156,6 +160,12 @@ ADJUSTMENT_REQUEST_HINTS = (
     "해봐",
     "하자",
     "할게",
+    "해야",
+    "야돼",
+    "야되",
+    "야할",
+    "야될",
+    "야겠",
     "겠습니다",
 )
 HEIGHT_POSTURE_HINTS = (
@@ -548,7 +558,11 @@ def _apply_worker_llm_policy_guard(
     action = str(response.get("action", "unknown"))
     direction = str(response.get("direction", "unclear")).lower()
 
-    if action in ("ask_clarification", "unknown") and local_direction:
+    explicit_reject = _has_any(_normalize(voice_text), REJECT_KEYWORDS)
+    if (
+        action in ("ask_clarification", "unknown")
+        or (action == "reject" and local_direction and not explicit_reject)
+    ) and local_direction:
         try:
             confidence = float(response.get("confidence", 0.0) or 0.0)
         except (TypeError, ValueError):
@@ -562,7 +576,7 @@ def _apply_worker_llm_policy_guard(
                 "confidence": max(confidence, 0.80),
                 "reason": _append_reason(
                     str(response.get("reason", "")),
-                    "명확한 올림/내림 방향이 있어 강도 표현을 조정 의도로 해석했습니다.",
+                    "명확한 올림/내림 방향이 있어 조정 의도로 해석했습니다.",
                 ),
             }
         )

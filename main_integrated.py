@@ -101,6 +101,7 @@ def decide_returning_policy(condition, is_risky_cycle):
     lead_type = condition["lead"]
     control_type = condition["control"]
 
+    # 비개입 조건(Condition 5): 작업 높이를 바꾸지 않고 현재 상태를 유지한다.
     if control_type == "None":
         return {
             "mode": "auto",
@@ -109,7 +110,9 @@ def decide_returning_policy(condition, is_risky_cycle):
             "is_risky": is_risky_cycle,
         }
 
+    # 작업자 주도 조건(Condition 3/4): 시스템이 바로 조정하지 않고 작업자에게 물어본다.
     if lead_type == "Worker":
+        # 작업자 주도 + LLM 제어(Condition 3): 위험 여부에 맞춰 LLM 안내 문구로 조정 의사를 묻는다.
         if control_type == "LLM":
             message = (
                 "불편자세를 감지했습니다. 작업 높이를 변경해드릴까요?"
@@ -117,10 +120,11 @@ def decide_returning_policy(condition, is_risky_cycle):
                 else "안전자세가 감지되었으나 작업높이를 변경해드릴까요?"
             )
         else:
+            # 작업자 주도 + Rule 제어(Condition 4): 위험 여부에 맞춰 규칙 기반 문구로 조정 의사를 묻는다.
             message = (
                 "자세 부담이 감지되었습니다. 작업높이를 변경할까요?"
                 if is_risky_cycle
-                else "작업높이를 변경할까요?"
+                else "자세 부담이 감지되지 않았습니다. 작업높이를 변경할까요?"
             )
         return {
             "mode": "ask_worker",
@@ -129,6 +133,7 @@ def decide_returning_policy(condition, is_risky_cycle):
             "is_risky": is_risky_cycle,
         }
 
+    # 시스템 주도 조건에서 위험 사이클이 아니면 조정하지 않고 유지한다.
     if not is_risky_cycle:
         return {
             "mode": "auto",
@@ -137,6 +142,7 @@ def decide_returning_policy(condition, is_risky_cycle):
             "is_risky": False,
         }
 
+    # 시스템 주도 + 위험 사이클(Condition 1/2): 작업자 확인 없이 자동으로 높이를 조정한다.
     if lead_type == "System":
         return {
             "mode": "auto",
@@ -145,6 +151,7 @@ def decide_returning_policy(condition, is_risky_cycle):
             "is_risky": True,
         }
 
+    # 예외적인 미분류 위험 조건: 안전하게 작업자 확인 모드로 보낸다.
     return {
         "mode": "ask_worker",
         "message": "방금 전 자세 불편이 감지되었습니다. 높이 조정을 진행할까요?",
@@ -285,7 +292,7 @@ def main():
     )
     data_logger = ExperimentDataLogger(RESULT_DIR, run_label=current_condition["name"])
     print(f"[RESULT RAW CSV] {data_logger.raw_path}")
-    print(f"[RESULT SUMMARY CSV] {data_logger.summary_path}")
+    print(f"[RESULT CONDITION METRICS CSV] {data_logger.summary_path}")
 
     def save_pass_goal_json(payload, label):
         try:
@@ -430,6 +437,8 @@ def main():
     def worker_adjustment_ack_message(worker_response):
         if current_condition["lead"] != "Worker":
             return None
+        if worker_response.get("action") == "reject":
+            return "네, 유지하겠습니다."
         if worker_response.get("action") not in ("approve", "adjust"):
             return None
 
@@ -501,6 +510,7 @@ def main():
         target_angle_deg = None
         angle_adjustment_deg = None
         target_angle_source = "none"
+        target_angle_clamped = False
         is_correction = False
 
         if not user_response_text:
@@ -539,6 +549,7 @@ def main():
 
                 proposed_target_angle = float(target_shoulder_angle_deg)
                 target_angle_deg = clamp_llm_safe_angle(proposed_target_angle)
+                target_angle_clamped = abs(target_angle_deg - proposed_target_angle) > 1e-6
                 print(
                     "[LLM 안전 목표각] "
                     f"proposed={proposed_target_angle:.2f}도 | "
@@ -593,6 +604,9 @@ def main():
             adjustment_z_mm=adjustment_z_mm,
             is_invalid=is_invalid,
             is_correction=is_correction,
+            pose_height_clamped=pose_result.was_height_clamped,
+            target_angle_clamped=target_angle_clamped,
+            is_worker_requested_adjustment=current_condition["lead"] == "Worker" and should_adjust,
         )
 
         response_action_for_row = response_action or ("adjust" if should_adjust else "maintain")
@@ -614,6 +628,7 @@ def main():
             drill_tcp_offset_cm=DRILL_TCP_OFFSET_CM,
             cycle=cycle,
             target_shoulder_angle_deg=target_angle_deg,
+            target_angle_clamped=target_angle_clamped,
             angle_adjustment_deg=angle_adjustment_deg,
             target_angle_source=target_angle_source,
             response_action=response_action_for_row,
@@ -796,7 +811,12 @@ def main():
                 tts_speaker.wait_until_done()
 
             if policy["mode"] == "auto":
-                if policy["is_risky"] and current_condition["lead"] == "System":
+                if (
+                    policy["is_risky"]
+                    and current_condition["lead"] == "System"
+                    and current_condition["intervention"] == "Intervention"
+                    and current_condition["control"] != "None"
+                ):
                     metrics.record_system_intervention()
 
                 if (
@@ -827,7 +847,7 @@ def main():
                         apply_next_target(
                             "[System+LLM] automatic adjustment",
                             True,
-                            target_shoulder_angle_deg=default_llm_safe_target_angle(),
+                            target_shoulder_angle_deg=llm_decision.target_shoulder_angle_deg,
                             llm_latency=llm_latency,
                             is_invalid=llm_decision.is_invalid,
                             response_action=llm_decision.action,
@@ -840,7 +860,7 @@ def main():
                         apply_next_target(
                             "[System+LLM fallback] safe-angle adjustment",
                             policy["should_adjust"],
-                            target_shoulder_angle_deg=default_llm_safe_target_angle(),
+                            target_shoulder_angle_deg=LLM_DEFAULT_SAFE_TARGET_DEG,
                             llm_latency=llm_latency,
                             is_invalid=llm_decision.is_invalid,
                             response_action=llm_decision.action,
