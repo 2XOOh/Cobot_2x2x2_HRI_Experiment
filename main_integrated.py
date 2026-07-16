@@ -313,7 +313,7 @@ def main() -> None:
         # 대표 어깨각도나 RULA proxy로 여기서 다시 위험 여부를 만들지 않는다.
         is_risky_cycle = bool(cycle_result.is_risky_cycle)
         condition_name = current_condition["name"]
-        worker_clarify_text = "잘 이해하지 못했습니다. 올려드릴까요 내려드릴까요?"
+        worker_clarify_text = "잘 이해하지 못했습니다. 올려드릴까요 내려드릴까요 유지할까요?"
 
         def keep_target() -> dict:
             return {
@@ -360,6 +360,7 @@ def main() -> None:
                 effective_safe_min_shoulder_angle_deg,
                 default_safe_shoulder_angle_deg,
                 effective_safe_max_shoulder_angle_deg,
+                is_first_completed_cycle=(trial_count == 0),
                 is_system_review=is_system_review,
             )
             metrics.record_llm_call(intent_interpreter.last_latency_s)

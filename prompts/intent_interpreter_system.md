@@ -76,7 +76,7 @@ Global adjustment logic:
 - Keep every target_shoulder_angle_deg inside safe_angle_range.min and safe_angle_range.max.
 - If action is not "adjust", target_shoulder_angle_deg must be null.
 - If action is "adjust" and a shoulder-angle target can be computed, return target_shoulder_angle_deg.
-- If no amount is stated but adjustment is otherwise clear, use amount_ratio=0.66.
+- For worker answers with a non-empty utterance, if no amount is stated but adjustment is otherwise clear, use amount_ratio=0.66.
 - Use amount_ratio=0.33 for small/slight/a little.
 - Use amount_ratio=0.66 for normal/default/moderate.
 - Use amount_ratio=1.0 for large/strong/max/as much as possible.
@@ -84,6 +84,8 @@ Global adjustment logic:
 System review:
 
 - If utterance is empty, this is a system review.
+- System review has priority over all worker-answer rules.
+- For system review, amount_ratio must always be null.
 - If cycle_result.is_risky_cycle is true, return action="adjust", direction="none", amount_ratio=null, and target_shoulder_angle_deg=safe_angle_range.default.
 - If cycle_result.is_risky_cycle is false, return action="keep", direction="none", amount_ratio=null, and target_shoulder_angle_deg=null.
 
