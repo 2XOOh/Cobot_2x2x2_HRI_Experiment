@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 
 
-# 손목에서 드릴 끝/TCP까지의 보정 길이는 사용자별 입력을 받지 않고 27 cm로 고정한다.
-DRILL_TCP_OFFSET_CM = 21.0
+# 손목에서 드릴 끝/TCP까지의 보정 길이는 사용자별 입력을 받지 않고 0.21 m로 고정한다.
+DRILL_TCP_OFFSET_M = 0.21
 
 # pose_generator_model_summary.txt의 4차 측정 기준 모델 파라미터다.
 BASE_HEIGHT_M = 0.6612
@@ -38,32 +38,36 @@ QUATERNION_SAMPLES_4TH: tuple[tuple[float, tuple[float, float, float, float]], .
 class HumanArmProfile:
     """수동 입력으로 받은 작업자 신체 치수를 저장한다."""
 
-    user_height_cm: float
-    shoulder_height_cm: float
-    upper_arm_cm: float
-    forearm_cm: float
-    drill_tcp_offset_cm: float = DRILL_TCP_OFFSET_CM
-
-    @property
-    def shoulder_height_m(self) -> float:
-        return self.shoulder_height_cm / 100.0
-
-    @property
-    def upper_arm_m(self) -> float:
-        return self.upper_arm_cm / 100.0
-
-    @property
-    def forearm_m(self) -> float:
-        return self.forearm_cm / 100.0
-
-    @property
-    def drill_tcp_offset_m(self) -> float:
-        return self.drill_tcp_offset_cm / 100.0
+    user_height_m: float
+    shoulder_height_m: float
+    upper_arm_m: float
+    forearm_m: float
+    drill_tcp_offset_m: float = DRILL_TCP_OFFSET_M
 
     @property
     def total_arm_length_m(self) -> float:
         # 이 모델에서 전체 팔 길이 L은 상완 + 하완 + 손목~드릴/TCP 보정 길이다.
         return self.upper_arm_m + self.forearm_m + self.drill_tcp_offset_m
+
+    @property
+    def user_height_cm(self) -> float:
+        return self.user_height_m * 100.0
+
+    @property
+    def shoulder_height_cm(self) -> float:
+        return self.shoulder_height_m * 100.0
+
+    @property
+    def upper_arm_cm(self) -> float:
+        return self.upper_arm_m * 100.0
+
+    @property
+    def forearm_cm(self) -> float:
+        return self.forearm_m * 100.0
+
+    @property
+    def drill_tcp_offset_cm(self) -> float:
+        return self.drill_tcp_offset_m * 100.0
 
 
 @dataclass(frozen=True)
@@ -115,7 +119,7 @@ class TcpPoseResult:
                 "was_height_clamped": self.was_height_clamped,
                 "shoulder_height_m": self.shoulder_height_m,
                 "total_arm_length_m": self.total_arm_length_m,
-                "drill_tcp_offset_cm": DRILL_TCP_OFFSET_CM,
+                "drill_tcp_offset_m": DRILL_TCP_OFFSET_M,
             },
         }
 
@@ -338,7 +342,7 @@ def prompt_human_arm_profile() -> HumanArmProfile:
     """
     기존 main_integrated.py의 신체 치수 입력 로직을 옮겨오기 위한 함수.
 
-    손목~드릴/TCP 보정 길이는 사용자에게 묻지 않고 27 cm로 고정한다.
+    손목~드릴/TCP 보정 길이는 사용자에게 묻지 않고 0.21 m로 고정한다.
     """
     print("\n" + "=" * 60)
     print(" 실험자 신체 정보 입력 (Enter를 누르면 기본값 적용)")
@@ -354,10 +358,10 @@ def prompt_human_arm_profile() -> HumanArmProfile:
     forearm_cm = _prompt_float(" 4. 하완 길이(팔꿈치~손목, cm) [기본: 25.0]: ", 25.0)
 
     profile = HumanArmProfile(
-        user_height_cm=user_height_cm,
-        shoulder_height_cm=shoulder_height_cm,
-        upper_arm_cm=upper_arm_cm,
-        forearm_cm=forearm_cm,
+        user_height_m=user_height_cm / 100.0,
+        shoulder_height_m=shoulder_height_cm / 100.0,
+        upper_arm_m=upper_arm_cm / 100.0,
+        forearm_m=forearm_cm / 100.0,
     )
     print(
         "\n [적용 완료] "
@@ -378,10 +382,10 @@ def make_human_arm_profile(
 ) -> HumanArmProfile:
     """main에서 이미 입력받은 값으로 HumanArmProfile을 만들 때 쓴다."""
     return HumanArmProfile(
-        user_height_cm=user_height_cm,
-        shoulder_height_cm=shoulder_height_cm,
-        upper_arm_cm=upper_arm_cm,
-        forearm_cm=forearm_cm,
+        user_height_m=user_height_cm / 100.0,
+        shoulder_height_m=shoulder_height_cm / 100.0,
+        upper_arm_m=upper_arm_cm / 100.0,
+        forearm_m=forearm_cm / 100.0,
     )
 
 

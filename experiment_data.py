@@ -248,7 +248,7 @@ class ExperimentMetrics:
     def record_worker_response(self, action: str) -> None:
         if action in ("approve", "adjust"):
             self.worker_approve_count += 1
-        elif action == "reject":
+        elif action in ("reject", "keep"):
             self.worker_reject_count += 1
 
     def record_system_intervention(self) -> None:
@@ -329,47 +329,31 @@ class ExperimentMetrics:
 class ExperimentDataLogger:
     """TrialRecord와 SummaryRecord를 results CSV 파일에 저장한다."""
 
-    # raw CSV는 trial/cycle 하나가 확정될 때 한 줄씩 저장한다.
     RAW_HEADER = [
-        # 실행 조건
         "Time", "Condition", "Trial_Num", "Lead_Type", "Control_Type", "Measured_Side",
-        # 실험 기준값
         "Risk_Shoulder_Threshold_deg", "Risky_Cycle_Ratio_Threshold",
-        # 피험자 치수
         "User_Height_cm", "Shoulder_Height_cm", "Upper_Arm_cm", "Forearm_cm", "Drill_TCP_Offset_cm",
-        # cycle 자세 결과
         "Task_Time_s", "Risky_Time_s", "Risky_Ratio", "Is_Risky_Cycle",
         "Visibility_OK_Time_s", "Visibility_OK_Ratio",
         "Representative_Shoulder_Angle_deg", "Avg_Shoulder_Angle_deg", "Avg_Elbow_Angle_deg",
         "Avg_RULA_Proxy", "Max_RULA_Proxy", "RULA_High_Ratio",
-        # 의사결정 결과
         "Target_Shoulder_Angle_deg", "Angle_Adjustment_deg", "Target_Angle_Source",
         "Response_Action", "Response_Source", "LLM_Confidence", "Decision_Reason", "LLM_Fallback",
-        # 로봇 목표와 전송 결과
         "Prev_Z_mm", "Final_Z_mm", "Adjustment_Z_mm", "User_Voice", "Final_Z_m",
         "Pose_Height_Clamped", "Robot_Command_Sent", "Is_Approved", "LLM_Latency_s", "Is_Invalid",
-        # TCP pose
         "Pose_X_m", "Pose_Y_m", "Pose_Z_m", "Pose_QX", "Pose_QY", "Pose_QZ", "Pose_QW",
     ]
 
-    # summary CSV는 실험 조건 1회 실행이 끝났을 때 한 줄 저장한다.
     SUMMARY_HEADER = [
-        # 실행 조건
         "Condition", "Completed_Transfers", "Measured_Side",
-        # 시간/위험 요약
         "Experiment_Duration_s", "Avg_Cycle_Task_Time_s",
         "Risky_Time_s", "Risky_Cycle_Count", "Risky_Cycle_Ratio_Total",
-        # 개입/명령 요약
         "System_Interventions", "Adjust_Count", "Avg_Adj_mm", "Correction_Cmds", "Invalid_Cmds",
-        # 작업자/LLM 응답 요약
         "Worker_Approve_Count", "Worker_Reject_Count",
         "LLM_Call_Count", "LLM_Fallback_Count", "Avg_LLM_Latency_s",
-        # 자세 요약
         "Avg_Representative_Shoulder_Angle_deg", "Avg_Shoulder_Angle_deg", "Avg_RULA_Proxy",
-        # 분석 기준값과 피험자 치수
         "Risk_Shoulder_Threshold_deg", "Risky_Cycle_Ratio_Threshold",
         "User_Height_cm", "Shoulder_Height_cm", "Upper_Arm_cm", "Forearm_cm", "Drill_TCP_Offset_cm",
-        # 종료 상태
         "Early_Stop_Flag",
     ]
 
@@ -378,8 +362,11 @@ class ExperimentDataLogger:
         self.raw_path = os.path.join(result_dir, "experiment_raw_data_per_trial.csv")
         self.summary_path = os.path.join(result_dir, "experiment_summary_matrix.csv")
         self.pass_goal_dir = os.path.join(result_dir, "pass_goal_json")
+        self.llm_response_dir = os.path.join(result_dir, "llm_response_json")
         os.makedirs(self.pass_goal_dir, exist_ok=True)
+        os.makedirs(self.llm_response_dir, exist_ok=True)
         self._pass_goal_json_index = 0
+        self._llm_response_json_index = 0
 
     def write_trial(self, record: TrialRecord) -> None:
         self._append_row(self.raw_path, self.RAW_HEADER, self._trial_to_row(record))
@@ -393,6 +380,19 @@ class ExperimentDataLogger:
         safe_label = _safe_filename_part(label)
         filename = f"{timestamp}_{self._pass_goal_json_index:03d}_{safe_label}.json"
         path = os.path.join(self.pass_goal_dir, filename)
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+
+        return path
+
+    def write_llm_response_json(self, payload: dict[str, Any], label: str) -> str:
+        self._llm_response_json_index += 1
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        safe_label = _safe_filename_part(label)
+        filename = f"{timestamp}_{self._llm_response_json_index:03d}_{safe_label}.json"
+        path = os.path.join(self.llm_response_dir, filename)
 
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -495,6 +495,7 @@ class ExperimentDataLogger:
             _round(record.drill_tcp_offset_cm, 1),
             record.early_stop_flag,
         ]
+
 
 def _mode_angle_by_bin(angles: list[float], bin_size_deg: float = 2.0, default: float = 0.0) -> float:
     """5도 단위로 묶어 가장 오래 머문 어깨각 구간의 대표값을 계산한다."""

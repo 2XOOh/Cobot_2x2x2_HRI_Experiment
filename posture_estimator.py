@@ -57,7 +57,7 @@ class PostureEstimator:
         wrist_pt = landmark_to_pixel(landmarks[SELECTED_LANDMARKS["wrist"]], width, height)
         hip_pt = landmark_to_pixel(landmarks[SELECTED_LANDMARKS["hip"]], width, height)
 
-        shoulder_angle_deg = calculate_angle(hip_pt, shoulder_pt, wrist_pt)
+        shoulder_angle_deg = calculate_angle(hip_pt, shoulder_pt, elbow_pt)
         elbow_angle_deg = calculate_angle(shoulder_pt, elbow_pt, wrist_pt)
         rula_proxy = estimate_rula_score(shoulder_angle_deg, elbow_angle_deg)
 
@@ -84,12 +84,9 @@ def empty_posture_sample() -> PostureSample:
 
 
 def landmarks_visible(landmarks) -> bool:
-    """각도 계산에 필요한 관절 4개가 충분히 보이는지 확인한다."""
-    return (
-        landmarks[SELECTED_LANDMARKS["shoulder"]].visibility > VISIBILITY_THRESHOLD
-        and landmarks[SELECTED_LANDMARKS["elbow"]].visibility > VISIBILITY_THRESHOLD
-        and landmarks[SELECTED_LANDMARKS["wrist"]].visibility > VISIBILITY_THRESHOLD
-        and landmarks[SELECTED_LANDMARKS["hip"]].visibility > VISIBILITY_THRESHOLD
+    return all(
+        landmarks[index].visibility > VISIBILITY_THRESHOLD
+        for index in SELECTED_LANDMARKS.values()
     )
 
 
@@ -108,7 +105,7 @@ def calculate_angle(a: list[int], b: list[int], c: list[int]) -> float:
     if mag_ba == 0 or mag_bc == 0:
         return 0.0
 
-    # cos(theta) = (BA dot BC) / (|BA| * |BC|)
+    '''cos(theta) = (BA dot BC) / (|BA| * |BC|)'''
     cosine_angle = max(-1.0, min(1.0, dot_product / (mag_ba * mag_bc)))
     return math.degrees(math.acos(cosine_angle))
 

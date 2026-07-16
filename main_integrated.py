@@ -1,31 +1,28 @@
-# main_integrated.py
-import math
+﻿from __future__ import annotations
+
 import os
 import time
 
 import cv2
 
 from experiment_data import ExperimentDataLogger, ExperimentMetrics, TrialRecord
+
 from hri_http_sender import GetRobotState, SendHoldFinished, SendPassGoal, SetReviewPending
 from pose_generator import (
-    DRILL_TCP_OFFSET_CM,
+    DRILL_TCP_OFFSET_M,
+    HumanArmProfile,
     HumanAwareTcpPoseGenerator,
-    make_human_arm_profile,
 )
 from posture_estimator import MEASURED_SIDE, PostureEstimator
 from voice_intent_interface import (
+    ACTION_COMPLETE,
     ContinuousSpeechRecognizer,
-    LlmIntentParser,
+    LlmIntentInterpreter,
     QueuedTtsSpeaker,
-    RuleIntentParser,
-    is_task_completion_input,
-    parse_worker_adjustment_input,
+    manual_task_completion_from_key,
 )
 
 
-# =========================================================
-# API 및 환경 설정
-# =========================================================
 OPENAI_API_KEY = ""
 LLAMA_BASE_URL = "https://api.groq.com/openai/v1"
 
@@ -34,8 +31,7 @@ MAX_EXPERIMENT_TIME_SEC = 480.0
 PILOT_FUNCTIONAL_MIN_SHOULDER_DEG = 60.0
 PILOT_FUNCTIONAL_MAX_SHOULDER_DEG = 80.0
 LLM_DEFAULT_SAFE_TARGET_DEG = 70.0
-LLM_SAFE_TARGET_UPPER_BUFFER_DEG = 3.0
-RULE_Z_STEP_MM = 50.0
+RULE_Z_STEP_M = 0.05
 ROBOT_STATE_POLL_SEC = 0.2
 RISK_SHOULDER_DEG = 110.0
 RISKY_CYCLE_RATIO_THRESHOLD = 0.60
@@ -59,210 +55,88 @@ CONDITIONS = {
 
 tts_speaker = QueuedTtsSpeaker()
 
-
-def shoulder_angle_from_floor_height_deg(
-    shoulder_height_m: float,
-    total_arm_length_m: float,
-    floor_height_m: float,
-) -> float:
-    if total_arm_length_m <= 0:
-        return PILOT_FUNCTIONAL_MIN_SHOULDER_DEG
-
-    value = (shoulder_height_m - floor_height_m) / total_arm_length_m
-    value = max(-1.0, min(1.0, value))
-    return math.degrees(math.acos(value))
-
-
-def robot_min_reachable_shoulder_angle_deg(
-    shoulder_height_m: float,
-    total_arm_length_m: float,
-    robot_min_floor_height_m: float,
-) -> float:
-    return shoulder_angle_from_floor_height_deg(
-        shoulder_height_m,
-        total_arm_length_m,
-        robot_min_floor_height_m,
-    )
-
-
-def speak(text):
-    # TTS 문장을 콘솔에 찍고 비동기 음성 출력 큐에 넣는다.
+def speak(text: str) -> None:
     print(f"[TTS] {text}")
     tts_speaker.speak(text)
 
 
-def speak_and_wait(text, timeout_sec=None):
+def speak_and_wait(text: str, timeout_sec: float | None = None) -> None:
     speak(text)
     tts_speaker.wait_until_done(timeout_sec=timeout_sec)
 
 
-def decide_returning_policy(condition, is_risky_cycle):
-    # 조건별 주도권과 위험 cycle 여부에 따라 유지/자동보정/작업자질문을 결정한다.
-    lead_type = condition["lead"]
-    control_type = condition["control"]
-
-    if control_type == "None":
-        return {
-            "mode": "auto",
-            "message": "비개입 조건이므로 기존 높이를 그대로 유지합니다.",
-            "should_adjust": False,
-            "is_risky": is_risky_cycle,
-        }
-
-    if lead_type == "Worker":
-        if control_type == "LLM":
-            message = (
-                "불편자세를 감지했습니다. 작업 높이를 변경해드릴까요?"
-                if is_risky_cycle
-                else "안전자세가 감지되었으나 작업높이를 변경해드릴까요?"
-            )
-        else:
-            message = (
-                "자세 부담이 감지되었습니다. 작업높이를 변경할까요?"
-                if is_risky_cycle
-                else "작업높이를 변경할까요?"
-            )
-        return {
-            "mode": "ask_worker",
-            "message": message,
-            "should_adjust": False,
-            "is_risky": is_risky_cycle,
-        }
-
-    if not is_risky_cycle:
-        return {
-            "mode": "auto",
-            "message": "안전자세가 감지되어 유지합니다.",
-            "should_adjust": False,
-            "is_risky": False,
-        }
-
-    if lead_type == "System":
-        return {
-            "mode": "auto",
-            "message": "불편자세가 감지되어 조정합니다.",
-            "should_adjust": True,
-            "is_risky": True,
-        }
-
-    return {
-        "mode": "ask_worker",
-        "message": "방금 전 자세 불편이 감지되었습니다. 높이 조정을 진행할까요?",
-        "should_adjust": False,
-        "is_risky": True,
-    }
-
-
-def main():
-    # 전체 HRI 실험 루프를 실행한다.
+def main() -> None:
     print("\n" + "=" * 60)
-    print(" 피실험자 신체 정보 입력 (엔터키를 누르면 괄호 안의 기본값 적용)")
+    print("작업자 신체 정보 입력")
     print("=" * 60)
 
     try:
-        in_h = input(" 1. 작업자 키 (cm) [기본: 175.0]: ")
-        user_height_cm = float(in_h) if in_h.strip() else 175.0
+        raw = input(" 1. 작업자 키(cm) [기본: 175.0]: ")
+        user_height_cm = float(raw) if raw.strip() else 175.0
     except Exception:
         user_height_cm = 175.0
 
     try:
-        default_sh = user_height_cm - 30.0
-        in_sh = input(f" 2. 어깨까지의 높이 (cm) [기본: {default_sh}]: ")
-        user_shoulder_height_cm = float(in_sh) if in_sh.strip() else default_sh
+        default_shoulder = user_height_cm - 30.0
+        raw = input(f" 2. 어깨 높이(cm) [기본: {default_shoulder:.1f}]: ")
+        user_shoulder_height_cm = float(raw) if raw.strip() else default_shoulder
     except Exception:
         user_shoulder_height_cm = user_height_cm - 30.0
 
     try:
-        in_l1 = input(" 3. 상완 길이 (어깨~팔꿈치, cm) [기본: 30.0]: ")
-        l1_cm = float(in_l1) if in_l1.strip() else 30.0
+        raw = input(" 3. 상완 길이(cm) [기본: 30.0]: ")
+        l1_cm = float(raw) if raw.strip() else 30.0
     except Exception:
         l1_cm = 30.0
 
     try:
-        in_l2 = input(" 4. 하완 길이 (팔꿈치~손목, cm) [기본: 25.0]: ")
-        l2_cm = float(in_l2) if in_l2.strip() else 25.0
+        raw = input(" 4. 하완 길이(cm) [기본: 25.0]: ")
+        l2_cm = float(raw) if raw.strip() else 25.0
     except Exception:
         l2_cm = 25.0
 
     print(
-        f"\n [적용 완료] 키: {user_height_cm}cm | 어깨 높이: {user_shoulder_height_cm}cm | "
-        f"상완: {l1_cm}cm | 하완: {l2_cm}cm"
+        f"\n[신체 정보] 키={user_height_cm:.1f}cm | 어깨={user_shoulder_height_cm:.1f}cm | "
+        f"상완={l1_cm:.1f}cm | 하완={l2_cm:.1f}cm"
     )
 
-    # 신체 치수는 pose generator가 쓸 profile로 한 번만 묶는다.
-    human_profile = make_human_arm_profile(
-        user_height_cm=user_height_cm,
-        shoulder_height_cm=user_shoulder_height_cm,
-        upper_arm_cm=l1_cm,
-        forearm_cm=l2_cm,
+    human_profile = HumanArmProfile(
+        user_height_m=user_height_cm / 100.0,
+        shoulder_height_m=user_shoulder_height_cm / 100.0,
+        upper_arm_m=l1_cm / 100.0,
+        forearm_m=l2_cm / 100.0,
     )
     pose_generator = HumanAwareTcpPoseGenerator()
-    robot_min_shoulder_deg = robot_min_reachable_shoulder_angle_deg(
-        shoulder_height_m=human_profile.shoulder_height_m,
-        total_arm_length_m=human_profile.total_arm_length_m,
-        robot_min_floor_height_m=pose_generator.min_floor_height_m,
-    )
-    effective_min_shoulder_deg = max(
-        PILOT_FUNCTIONAL_MIN_SHOULDER_DEG,
-        robot_min_shoulder_deg,
-    )
-    robot_max_shoulder_deg = shoulder_angle_from_floor_height_deg(
-        shoulder_height_m=human_profile.shoulder_height_m,
-        total_arm_length_m=human_profile.total_arm_length_m,
-        floor_height_m=pose_generator.max_floor_height_m,
-    )
-    safe_range_upper_shoulder_deg = min(
-        robot_max_shoulder_deg,
-        max(effective_min_shoulder_deg, PILOT_FUNCTIONAL_MAX_SHOULDER_DEG),
-    )
 
-    def clamp_llm_safe_angle(target_angle_deg: float) -> float:
-        lower = effective_min_shoulder_deg
-        upper = safe_range_upper_shoulder_deg
-        if lower > upper:
-            return lower
-        return max(lower, min(upper, float(target_angle_deg)))
+    effective_safe_min_shoulder_angle_deg = PILOT_FUNCTIONAL_MIN_SHOULDER_DEG
+    effective_safe_max_shoulder_angle_deg = PILOT_FUNCTIONAL_MAX_SHOULDER_DEG
+    default_safe_shoulder_angle_deg = LLM_DEFAULT_SAFE_TARGET_DEG
 
-    def default_llm_safe_target_angle() -> float:
-        if effective_min_shoulder_deg > LLM_DEFAULT_SAFE_TARGET_DEG + LLM_SAFE_TARGET_UPPER_BUFFER_DEG:
-            return effective_min_shoulder_deg
-        return clamp_llm_safe_angle(LLM_DEFAULT_SAFE_TARGET_DEG)
-
-    def current_rule_step_floor_height_m(direction: str) -> float:
-        step_m = RULE_Z_STEP_MM / 1000.0
-        current_floor_height_m = current_tighten_z_mm / 1000.0
-        if direction == "up":
-            return current_floor_height_m + step_m
-        if direction == "down":
-            return current_floor_height_m - step_m
-        return current_floor_height_m
-
-    print(
-        "[RULE 높이 정책] "
-        f"로봇 최저 도달 어깨각={robot_min_shoulder_deg:.2f}도 | "
-        f"개인별 effective_min={effective_min_shoulder_deg:.2f}도 | "
-        f"로봇 최고 도달 어깨각={robot_max_shoulder_deg:.2f}도"
-    )
 
     print("\n" + "=" * 60)
-    for k, v in CONDITIONS.items():
-        print(f" [{k}] {v['name']}")
+    for key_num, condition in CONDITIONS.items():
+        print(f" [{key_num}] {condition['name']}")
     print("=" * 60)
     try:
-        choice = int(input("수행할 실험 조건 번호를 입력하세요 (1~5): "))
+        choice = int(input("실험 조건 번호를 입력하세요 (1~5): "))
     except Exception:
         choice = 1
     current_condition = CONDITIONS.get(choice, CONDITIONS[1])
+    print(f"[CONDITION] {current_condition['name']}")
 
-    # 음성 입력은 완료 감지, rule 응답, LLM 조정 의도 해석으로 나누어 처리한다.
-    rule_intent_parser = RuleIntentParser()
-    llm_intent_parser = LlmIntentParser(api_key=OPENAI_API_KEY, base_url=LLAMA_BASE_URL) if OPENAI_API_KEY else None
+    intent_interpreter = (
+        LlmIntentInterpreter(api_key=OPENAI_API_KEY, base_url=LLAMA_BASE_URL)
+        if OPENAI_API_KEY
+        else None
+    )
+    if intent_interpreter is None:
+        print("[LLM DISABLED] OPENAI_API_KEY is empty. Voice intent requires manual keys.")
+
     speech_recognizer = ContinuousSpeechRecognizer(
-        on_text=lambda text: print(f"🗣️ [음성 인식]: '{text}'")
+        on_text=lambda text: print(f"[STT] '{text}'")
     )
     speech_recognizer.start()
 
-    # 카메라 파일은 프레임마다 자세값을 만들고 화면용 skeleton을 그린다.
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("[CAMERA ERROR] 카메라를 열 수 없어 실험을 시작하지 않습니다.")
@@ -275,325 +149,120 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_FRAME_HEIGHT)
     cv2.namedWindow(DISPLAY_WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(DISPLAY_WINDOW_NAME, DISPLAY_WINDOW_WIDTH, DISPLAY_WINDOW_HEIGHT)
-    posture_estimator = PostureEstimator()
 
-    # metrics는 cycle 누적/위험 판정/summary 계산을 담당하고 logger는 CSV 저장만 담당한다.
+    posture_estimator = PostureEstimator()
     metrics = ExperimentMetrics(
         risk_shoulder_deg=RISK_SHOULDER_DEG,
         risky_cycle_ratio_threshold=RISKY_CYCLE_RATIO_THRESHOLD,
         rula_high_score_threshold=RULA_HIGH_SCORE_THRESHOLD,
     )
     data_logger = ExperimentDataLogger(RESULT_DIR)
+    
+    review_cycle_result = None
+    last_task_sample_time = 0.0
+    current_target_floor_height_m = 0.0
+    trial_count = 0
 
-    def save_pass_goal_json(payload, label):
+    # Save pass-goal payloads for trial traceability.
+    def save_pass_goal_json(payload: dict, label: str) -> None:
         try:
             json_path = data_logger.write_pass_goal_json(payload, label)
-            print(f"[PASS_GOAL JSON 저장] {json_path}")
-        except Exception as e:
-            print(f"[PASS_GOAL JSON 저장 실패] {e}")
+            print(f"[PASS_GOAL JSON saved] {json_path}")
+        except Exception as exc:
+            print(f"[PASS_GOAL JSON save failed] {exc}")
 
-    trial_count = 0
-    wait_start_time = 0.0
-    current_tighten_z_mm = 0.0
-    last_task_sample_time = 0.0
-    completion_sent = False
-    awaiting_worker_answer = False
-    current_cycle_result = None
-    key = -1
-
-    robot_state = "UNKNOWN"
-    previous_robot_state = None
-    next_robot_state_poll_time = 0.0
-    experiment_start_time = 0.0
-
-    def build_adjustment_metadata():
-        # LLM과 rule parser가 볼 cycle 결과를 한 dict로 정리한다.
-        cycle = current_cycle_result
-        if cycle is None:
-            raise RuntimeError("cycle 결과가 만들어지기 전에 조정 metadata를 요청했습니다.")
-
-        current_robot_shoulder_deg = shoulder_angle_from_floor_height_deg(
-            shoulder_height_m=human_profile.shoulder_height_m,
-            total_arm_length_m=human_profile.total_arm_length_m,
-            floor_height_m=current_tighten_z_mm / 1000.0,
-        )
-
-        return {
+    # LLM 요청 payload와 모델 원문 응답을 별도 JSON으로 남긴다.
+    def save_llm_response_json(label: str) -> None:
+        if intent_interpreter is None:
+            return
+        payload = {
             "condition": current_condition,
-            "cycle_task_time_sec": cycle.task_time_s,
-            "cycle_risky_time_sec": cycle.risky_time_s,
-            "cycle_risky_ratio": cycle.risky_ratio,
-            "cycle_is_risky": cycle.is_risky_cycle,
-            "cycle_representative_shoulder_angle_deg": cycle.representative_shoulder_angle_deg,
-            "cycle_avg_elbow_angle_deg": cycle.avg_elbow_angle_deg,
-            "cycle_avg_rula_proxy_score": cycle.avg_rula_proxy,
-            "cycle_max_rula_proxy_score": cycle.max_rula_proxy,
-            "cycle_rula_high_ratio": cycle.rula_high_ratio,
-            "current_work_z_mm": current_tighten_z_mm,
-            "pilot_functional_min_shoulder_deg": PILOT_FUNCTIONAL_MIN_SHOULDER_DEG,
-            "pilot_functional_max_shoulder_deg": PILOT_FUNCTIONAL_MAX_SHOULDER_DEG,
-            "robot_min_reachable_shoulder_deg": robot_min_shoulder_deg,
-            "robot_max_reachable_shoulder_deg": robot_max_shoulder_deg,
-            "effective_min_shoulder_deg": effective_min_shoulder_deg,
-            "current_robot_shoulder_angle_deg": current_robot_shoulder_deg,
-            "llm_default_safe_target_deg": default_llm_safe_target_angle(),
-            "rule_z_step_mm": RULE_Z_STEP_MM,
-            "robot_min_floor_height_m": pose_generator.min_floor_height_m,
-            "risk_trigger_deg": RISK_SHOULDER_DEG,
-            "user_shoulder_height_mm": user_shoulder_height_cm * 10,
-            "upper_arm_mm": l1_cm * 10,
-            "forearm_mm": l2_cm * 10,
-            "drill_tcp_offset_mm": DRILL_TCP_OFFSET_CM * 10,
-            "total_arm_length_mm": human_profile.total_arm_length_m * 1000.0,
+            "trial_num": trial_count + 1,
+            "label": label,
+            "model": intent_interpreter.model,
+            "latency_s": intent_interpreter.last_latency_s,
+            "request_payload": intent_interpreter.last_request_payload,
+            "raw_response": intent_interpreter.last_raw_response,
+            "parsed_response": intent_interpreter.last_parsed_response,
+            "error": intent_interpreter.last_error,
         }
+        try:
+            json_path = data_logger.write_llm_response_json(payload, label)
+            print(f"[LLM JSON saved] {json_path}")
+        except Exception as exc:
+            print(f"[LLM JSON save failed] {exc}")
 
-    def build_system_llm_metadata():
-        metadata = build_adjustment_metadata()
-        return {
-            "condition": metadata["condition"],
-            "cycle_is_risky": metadata["cycle_is_risky"],
-            "cycle_representative_shoulder_angle_deg": metadata[
-                "cycle_representative_shoulder_angle_deg"
-            ],
-            "effective_min_shoulder_deg": metadata["effective_min_shoulder_deg"],
-            "pilot_functional_min_shoulder_deg": metadata[
-                "pilot_functional_min_shoulder_deg"
-            ],
-            "pilot_functional_max_shoulder_deg": metadata[
-                "pilot_functional_max_shoulder_deg"
-            ],
-            "robot_min_reachable_shoulder_deg": metadata[
-                "robot_min_reachable_shoulder_deg"
-            ],
-            "robot_max_reachable_shoulder_deg": metadata[
-                "robot_max_reachable_shoulder_deg"
-            ],
-            "llm_default_safe_target_deg": metadata["llm_default_safe_target_deg"],
-        }
+ 
+    # pose_generator가 만든 목표 pose를 로봇에 보내고 높이 변화량을 반환한다.
+    def send_pose_goal(
+        pose_result,
+        trial_number: int,
+        previous_target_floor_height_m: float,
+    ) -> tuple[float, float, bool]:
+        next_target_floor_height_m = pose_result.target_floor_height_m
+        adjustment_m = next_target_floor_height_m - previous_target_floor_height_m
+        if abs(adjustment_m) <= 1e-9:
+            print("[PASS_GOAL skipped] Target height unchanged.")
+            return next_target_floor_height_m, adjustment_m, False
 
-    def worker_target_limit_message(direction, target_shoulder_angle_deg):
-        current_floor_height_m = current_tighten_z_mm / 1000.0
-        target_angle_deg = None
+        payload = pose_result.to_pass_goal_dict(msg=f"Trial {trial_number} Setup")
+        save_pass_goal_json(payload, f"trial_{trial_number:03d}_pass_goal")
+        robot_command_sent = SendPassGoal(payload)
+        if not robot_command_sent:
+            print("[PASS_GOAL failed] Next target was not sent to robot.")
+        return next_target_floor_height_m, adjustment_m, robot_command_sent
 
-        if target_shoulder_angle_deg is not None:
-            target_angle_deg = clamp_llm_safe_angle(float(target_shoulder_angle_deg))
-            preview = pose_generator.generate_pose_from_shoulder_angle(
-                target_angle_deg,
-                human_profile,
-            )
-            if abs(preview.target_floor_height_m - current_floor_height_m) > 1e-6:
-                return None
-
-        if direction == "down" and current_floor_height_m <= pose_generator.min_floor_height_m + 1e-6:
-            return (
-                "현재 로봇이 전달할 수 있는 최저 높이입니다. "
-                "더 낮춰서 전달할 수 없습니다. 다시 말씀해 주세요."
-            )
-        if direction == "up" and current_floor_height_m >= pose_generator.max_floor_height_m - 1e-6:
-            return (
-                "현재 로봇이 전달할 수 있는 최고 높이입니다. "
-                "더 높여서 전달할 수 없습니다. 다시 말씀해 주세요."
-            )
-        if target_angle_deg is not None and current_condition["control"] == "LLM":
-            current_robot_angle_deg = shoulder_angle_from_floor_height_deg(
-                shoulder_height_m=human_profile.shoulder_height_m,
-                total_arm_length_m=human_profile.total_arm_length_m,
-                floor_height_m=current_floor_height_m,
-            )
-            angle_tolerance_deg = 0.05
-            if (
-                direction == "up"
-                and (
-                    target_angle_deg >= safe_range_upper_shoulder_deg - angle_tolerance_deg
-                    or current_robot_angle_deg >= safe_range_upper_shoulder_deg - angle_tolerance_deg
-                )
-            ):
-                return (
-                    "현재 안전 범위의 최고 높이입니다. "
-                    "안전 범위를 넘어 더 높일 수 없습니다. 다시 말씀해 주세요."
-                )
-            if (
-                direction == "down"
-                and (
-                    target_angle_deg <= effective_min_shoulder_deg + angle_tolerance_deg
-                    or current_robot_angle_deg <= effective_min_shoulder_deg + angle_tolerance_deg
-                )
-            ):
-                return (
-                    "현재 안전 범위의 최저 높이입니다. "
-                    "안전 범위를 넘어 더 낮출 수 없습니다. 다시 말씀해 주세요."
-                )
-        return None
-
-    def worker_adjustment_ack_message(worker_response):
-        if current_condition["lead"] != "Worker":
-            return None
-        if worker_response.get("action") not in ("approve", "adjust"):
-            return None
-
-        direction = str(worker_response.get("direction", "")).lower()
-        if direction not in ("up", "down"):
-            return None
-
-        if (
-            current_condition["control"] == "LLM"
-            and current_cycle_result is not None
-            and bool(current_cycle_result.is_risky_cycle)
-            # and is_policy_risky_cycle(current_cycle_result)
-        ):
-            return "네, 안전 각도로 조정하겠습니다."
-
-        strength = worker_adjustment_strength_from_text(worker_response.get("text", ""))
-        if direction == "up":
-            if strength == "small":
-                return "네, 조금 올리겠습니다."
-            if strength == "strong":
-                return "네, 강하게 올리겠습니다."
-            return "네, 올리겠습니다."
-
-        if strength == "small":
-            return "네, 조금 내리겠습니다."
-        if strength == "strong":
-            return "네, 강하게 내리겠습니다."
-        return "네, 내리겠습니다."
-
-    def worker_adjustment_strength_from_text(text):
-        normalized = str(text or "").lower().replace(" ", "")
-        if any(keyword in normalized for keyword in ("조금", "조금만", "살짝", "약간", "쪼금")):
-            return "small"
-        if any(
-            keyword in normalized
-            for keyword in ("확", "많이", "강하게", "크게", "최대한", "제일", "끝까지")
-        ):
-            return "strong"
-        return "normal"
-
-    def apply_next_target(
-        user_response_text,
-        should_adjust,
-        target_shoulder_angle_deg=None,
-        llm_latency=0.0,
-        is_invalid=False,
-        response_action="",
-        response_source="",
-        response_direction="",
-        llm_confidence=0.0,
-        decision_reason="",
-        llm_fallback=False,
-    ):
-        # RETURNING 평가 뒤 다음 cycle TCP pose를 계산하고 trial 한 줄을 저장한다.
-        nonlocal trial_count, current_tighten_z_mm, awaiting_worker_answer, completion_sent
-
-        cycle = current_cycle_result
-        if cycle is None:
-            raise RuntimeError("cycle 결과가 만들어지기 전에 다음 target을 계산했습니다.")
-
-        trial_count += 1
-        previous_target_z_mm = current_tighten_z_mm
-        target_angle_deg = None
-        angle_adjustment_deg = None
-        target_angle_source = "none"
-        is_correction = False
-
-        if not user_response_text:
-            user_response_text = f"Task completed; risky time {cycle.risky_time_s:.2f}s"
-
-        if should_adjust:
-            is_rule_z_step = response_source in ("system_rule", "rule_llm")
-            if is_rule_z_step:
-                target_floor_height_m = current_rule_step_floor_height_m(response_direction)
-                pose_result = pose_generator.generate_pose_from_floor_height(
-                    target_floor_height_m,
-                    human_profile,
-                )
-                target_angle_deg = shoulder_angle_from_floor_height_deg(
-                    shoulder_height_m=human_profile.shoulder_height_m,
-                    total_arm_length_m=human_profile.total_arm_length_m,
-                    floor_height_m=pose_result.target_floor_height_m,
-                )
-                angle_adjustment_deg = target_angle_deg - cycle.representative_shoulder_angle_deg
-                if response_source == "system_rule" or response_direction == "down":
-                    target_angle_source = "rule_z_minus_50mm"
-                elif response_direction == "up":
-                    target_angle_source = "rule_z_plus_50mm"
-                else:
-                    target_angle_source = "rule_z_step_50mm"
-                print(
-                    "[Rule z-step] "
-                    f"direction={response_direction} | "
-                    f"prev_z={previous_target_z_mm:.1f}mm | "
-                    f"target_z={pose_result.target_floor_height_m * 1000.0:.1f}mm | "
-                    f"equiv_angle={target_angle_deg:.2f}도"
-                )
-            else:
-                if target_shoulder_angle_deg is None:
-                    raise ValueError("높이 조정에는 명시적인 목표 어깨각이 필요합니다.")
-
-                proposed_target_angle = float(target_shoulder_angle_deg)
-                target_angle_deg = clamp_llm_safe_angle(proposed_target_angle)
-                print(
-                    "[LLM 안전 목표각] "
-                    f"proposed={proposed_target_angle:.2f}도 | "
-                    f"final={target_angle_deg:.2f}도 | "
-                    f"allowed={effective_min_shoulder_deg:.2f}~{safe_range_upper_shoulder_deg:.2f}도"
-                )
-                if response_source == "system_llm_fallback":
-                    target_angle_source = "llm_safe_70deg_fallback"
-                elif current_condition["lead"] == "System" and current_condition["control"] == "LLM":
-                    target_angle_source = "llm_safe_70deg"
-                else:
-                    target_angle_source = "llm_safe_range"
-
-                angle_adjustment_deg = target_angle_deg - cycle.representative_shoulder_angle_deg
-                pose_result = pose_generator.generate_pose_from_shoulder_angle(
-                    target_angle_deg,
-                    human_profile,
-                )
-            is_approved = True
-        else:
-            # 조정하지 않는 경우에는 현재 pass 높이를 그대로 pose로 다시 만든다.
-            pose_result = pose_generator.generate_pose_from_floor_height(
-                current_tighten_z_mm / 1000.0,
-                human_profile,
-            )
-            is_approved = False
-
-        next_target_z_mm = pose_result.target_floor_height_m * 1000.0
-        next_target_floor_z_m = next_target_z_mm / 1000.0
-        adjustment_z_mm = next_target_z_mm - previous_target_z_mm
-
-        should_send_next_goal = abs(adjustment_z_mm) > 1e-6
-        current_tighten_z_mm = next_target_z_mm
-
-        robot_command_sent = False
-        if should_send_next_goal:
-            payload = pose_result.to_pass_goal_dict(msg=f"Trial {trial_count} Setup")
-            save_pass_goal_json(payload, f"trial_{trial_count:03d}_pass_goal")
-            robot_command_sent = SendPassGoal(payload)
-            if not robot_command_sent:
-                print("[PASS_GOAL 실패] 다음 목표가 로봇으로 전송되지 않았습니다.")
-        else:
-            print("[PASS_GOAL 생략] 이전 목표를 그대로 유지합니다.")
+    # resolve_returning_pose_target()의 결과와 실제 전송 pose를 raw trial로 기록한다.
+    def write_target_trial_record(
+        target_info: dict,
+        cycle,
+        pose_result,
+        trial_number: int,
+        previous_target_floor_height_m: float,
+        next_target_floor_height_m: float,
+        adjustment_m: float,
+        robot_command_sent: bool,
+    ) -> None:
+        action = str(target_info.get("action", "keep"))
+        target_type = str(target_info.get("target_type", "none"))
+        response_source = str(target_info.get("response_source", target_type))
+        llm_confidence = float(target_info.get("confidence") or 0.0)
+        decision_reason = str(target_info.get("reason", ""))
+        llm_fallback = bool(target_info.get("llm_fallback", False))
+        llm_latency_s = float(target_info.get("llm_latency_s") or 0.0)
+        user_voice = str(target_info.get("user_voice", ""))
+        is_invalid = bool(target_info.get("is_invalid", action == "clarify"))
+        should_adjust = action == "adjust"
 
         if llm_fallback:
             metrics.record_llm_fallback()
-        if current_condition["lead"] == "Worker":
-            metrics.record_worker_response(response_action)
+        if (
+            should_adjust
+            and current_condition["lead"] == "System"
+            and cycle.is_risky_cycle
+        ):
+            metrics.record_system_intervention()
 
         metrics.record_completed_trial(
             cycle=cycle,
-            adjustment_z_mm=adjustment_z_mm,
+            adjustment_z_mm=adjustment_m * 1000.0,
             is_invalid=is_invalid,
-            is_correction=is_correction,
+            is_correction=should_adjust,
         )
+        if current_condition["lead"] == "Worker":
+            metrics.record_worker_response(action)
 
-        response_action_for_row = response_action or ("adjust" if should_adjust else "maintain")
-        response_source_for_row = response_source or "policy"
+        target_shoulder_angle_deg = target_info.get("target_shoulder_angle_deg")
+        angle_adjustment_deg = (
+            float(target_shoulder_angle_deg) - cycle.representative_shoulder_angle_deg
+            if target_shoulder_angle_deg is not None
+            else None
+        )
 
         trial_record = TrialRecord(
             timestamp=time.strftime("%Y-%m-%d %H:%M:%S"),
             condition_name=current_condition["name"],
-            trial_num=trial_count,
+            trial_num=trial_number,
             lead_type=current_condition["lead"],
             control_type=current_condition["control"],
             measured_side=MEASURED_SIDE,
@@ -603,25 +272,25 @@ def main():
             shoulder_height_cm=user_shoulder_height_cm,
             upper_arm_cm=l1_cm,
             forearm_cm=l2_cm,
-            drill_tcp_offset_cm=DRILL_TCP_OFFSET_CM,
+            drill_tcp_offset_cm=DRILL_TCP_OFFSET_M * 100.0,
             cycle=cycle,
-            target_shoulder_angle_deg=target_angle_deg,
+            target_shoulder_angle_deg=target_shoulder_angle_deg,
             angle_adjustment_deg=angle_adjustment_deg,
-            target_angle_source=target_angle_source,
-            response_action=response_action_for_row,
-            response_source=response_source_for_row,
+            target_angle_source=target_type,
+            response_action=action,
+            response_source=response_source,
             llm_confidence=llm_confidence,
             decision_reason=decision_reason,
             llm_fallback=llm_fallback,
-            prev_z_mm=previous_target_z_mm,
-            final_z_mm=next_target_z_mm,
-            adjustment_z_mm=adjustment_z_mm,
-            user_voice=user_response_text,
-            final_z_m=next_target_floor_z_m,
+            prev_z_mm=previous_target_floor_height_m * 1000.0,
+            final_z_mm=next_target_floor_height_m * 1000.0,
+            adjustment_z_mm=adjustment_m * 1000.0,
+            user_voice=user_voice,
+            final_z_m=pose_result.target_floor_height_m,
             pose_height_clamped=pose_result.was_height_clamped,
             robot_command_sent=robot_command_sent,
-            is_approved=is_approved,
-            llm_latency_s=llm_latency,
+            is_approved=should_adjust,
+            llm_latency_s=llm_latency_s,
             is_invalid=is_invalid,
             pose_x_m=pose_result.x_m,
             pose_y_m=pose_result.y_m,
@@ -633,20 +302,220 @@ def main():
         )
         data_logger.write_trial(trial_record)
 
-        SetReviewPending(False)
-        awaiting_worker_answer = False
-        completion_sent = False
+    def resolve_returning_pose_target(cycle_result) -> dict:
+        # RETURNING에서 cycle_result와 current_condition을 보고 pose_generator 입력을 만든다.
+        # 컨디션별 실험 로직은 유지한다.
+        # - System+LLM, Worker+LLM: LLM이 만든 target_shoulder_angle_deg를 사용한다.
+        # - System+Rule, Worker+Rule: target_shoulder_angle_deg를 쓰지 않고 floor height를 5cm step으로 바꾼다.
+        # - Control: 위험 여부와 상관없이 유지한다.
+        #
+        # 위험 판단은 무조건 cycle_result.is_risky_cycle 하나만 쓴다.
+        # 대표 어깨각도나 RULA proxy로 여기서 다시 위험 여부를 만들지 않는다.
+        is_risky_cycle = bool(cycle_result.is_risky_cycle)
+        condition_name = current_condition["name"]
+        worker_clarify_text = "잘 이해하지 못했습니다. 올려드릴까요 내려드릴까요?"
 
-    # 초기 pass goal은 목표 어깨각 130도에서 미리 계산한다.
-    print(f"[INITIAL GOAL READY] 목표 어깨각 {INITIAL_SHOULDER_ANGLE_DEG:.1f}도 초기 위치를 계산합니다.")
-    initial_pose = pose_generator.generate_pose_from_shoulder_angle(
-        INITIAL_SHOULDER_ANGLE_DEG,
-        human_profile,
-    )
-    current_tighten_z_mm = initial_pose.target_floor_height_m * 1000.0
+        def keep_target() -> dict:
+            return {
+                "action": "keep",
+                "target_type": "none",
+                "target_floor_height_m": None,
+                "target_shoulder_angle_deg": None,
+            }
 
-    # 카메라 화면에서 자세를 확인하고 S를 누르면 초기 goal 전송과 8분 타이머를 시작한다.
-    print("[START READY] 카메라 화면을 확인한 뒤 S를 누르면 실험을 시작합니다. Q/ESC는 종료입니다.")
+        def clarify_target() -> dict:
+            return {
+                "action": "clarify",
+                "target_type": "none",
+                "target_floor_height_m": None,
+                "target_shoulder_angle_deg": None,
+            }
+
+        def floor_target(target_floor_height_m: float) -> dict:
+            clamped_floor_height_m = max(
+                pose_generator.min_floor_height_m,
+                min(pose_generator.max_floor_height_m, float(target_floor_height_m)),
+            )
+            return {
+                "action": "adjust",
+                "target_type": "floor_height",
+                "target_floor_height_m": clamped_floor_height_m,
+                "target_shoulder_angle_deg": None,
+            }
+
+        def shoulder_target(target_shoulder_angle_deg: float) -> dict:
+            return {
+                "action": "adjust",
+                "target_type": "shoulder_angle",
+                "target_floor_height_m": None,
+                "target_shoulder_angle_deg": float(target_shoulder_angle_deg),
+            }
+
+        def call_adjustment_llm(worker_text: str | None, is_system_review: bool):
+            if intent_interpreter is None:
+                return None
+            intent = intent_interpreter.interpret_adjustment(
+                worker_text,
+                cycle_result,
+                effective_safe_min_shoulder_angle_deg,
+                default_safe_shoulder_angle_deg,
+                effective_safe_max_shoulder_angle_deg,
+                is_system_review=is_system_review,
+            )
+            metrics.record_llm_call(intent_interpreter.last_latency_s)
+            save_llm_response_json(
+                f"trial_{trial_count + 1:03d}_{'system_adjustment' if is_system_review else 'worker_adjustment'}"
+            )
+            return intent
+
+        def wait_for_worker_voice(question_text: str, timeout_sec: float = 8.0) -> str | None:
+            # 작업자 주도 조건에서는 이 함수 안에서 질문하고 답변을 받는 것이 최종 의도다.
+            # 지금은 background STT의 최신 텍스트를 짧게 기다리는 초안이다.
+            speech_recognizer.get_and_clear()
+            speak_and_wait(question_text)
+            deadline = time.time() + timeout_sec
+            while time.time() < deadline:
+                worker_voice = speech_recognizer.get_and_clear()
+                if worker_voice:
+                    return worker_voice
+                time.sleep(0.05)
+            return None
+
+        match condition_name:
+            case "Cond1_Sys_LLM":
+                # 시스템 주도 + LLM:
+                # 위험하지 않으면 유지한다.
+                # 위험하면 빈 utterance로 조정 LLM을 호출하고 target_shoulder_angle_deg만 사용한다.
+                if not is_risky_cycle:
+                    return keep_target()
+
+                intent = call_adjustment_llm(worker_text="", is_system_review=True)
+                if intent is None:
+                    return clarify_target()
+
+                # Cond1 System+LLM:
+                # 의도해석기 출력 중 action과 target_shoulder_angle_deg만 사용한다.
+                # direction, amount_ratio는 이 조건에서 쓰지 않으므로 None 처리한 것과 같다.
+                condition_intent = {
+                    "action": intent.action,
+                    "direction": None,
+                    "amount_ratio": None,
+                    "target_shoulder_angle_deg": intent.target_shoulder_angle_deg,
+                    "confidence": intent.confidence,
+                    "reason": intent.reason,
+                }
+
+                if condition_intent["action"] == "keep":
+                    return keep_target()
+                if condition_intent["action"] == "adjust" and condition_intent["target_shoulder_angle_deg"] is not None:
+                    return shoulder_target(condition_intent["target_shoulder_angle_deg"])
+                return clarify_target()
+
+            case "Cond2_Sys_Rule":
+                # 시스템 주도 + Rule:
+                # 위험하지 않으면 유지한다.
+                # 위험하면 현재 floor height에서 5cm 내린다.
+                if not is_risky_cycle:
+                    return keep_target()
+
+                return floor_target(current_target_floor_height_m - RULE_Z_STEP_M)
+
+            case "Cond3_Worker_LLM":
+                # 작업자 주도 + LLM:
+                # 위험/비위험에 따라 질문 문구를 다르게 말한다.
+                # 작업자 답변은 조정 LLM으로 해석하고, target_shoulder_angle_deg만 실행에 사용한다.
+                # 답변이 비었거나 애매하면 같은 자리에서 다시 질문한다.
+                question_text = (
+                    "방금 작업 자세에서 부담이 감지됐습니다. 작업 높이를 변경할까요?"
+                    if is_risky_cycle
+                    else "현재 작업 자세는 위험하지 않았습니다. 그래도 작업 높이를 변경할까요?"
+                )
+                while True:
+                    worker_voice = wait_for_worker_voice(question_text)
+                    question_text = worker_clarify_text
+                    if not worker_voice:
+                        continue
+
+                    intent = call_adjustment_llm(worker_text=worker_voice, is_system_review=False)
+                    if intent is None:
+                        continue
+
+                    # Cond3 Worker+LLM:
+                    # 의도해석기 출력의 action, direction, amount_ratio, target_shoulder_angle_deg를 모두 사용한다.
+                    # LLM은 direction/amount_ratio를 바탕으로 target_shoulder_angle_deg까지 계산해줘야 한다.
+                    condition_intent = {
+                        "action": intent.action,
+                        "direction": intent.direction,
+                        "amount_ratio": intent.amount_ratio,
+                        "target_shoulder_angle_deg": intent.target_shoulder_angle_deg,
+                        "confidence": intent.confidence,
+                        "reason": intent.reason,
+                    }
+
+                    if condition_intent["action"] == "keep":
+                        return keep_target()
+                    if (
+                        condition_intent["action"] == "adjust"
+                        and condition_intent["target_shoulder_angle_deg"] is not None
+                    ):
+                        return shoulder_target(condition_intent["target_shoulder_angle_deg"])
+
+            case "Cond4_Worker_Rule":
+                # 작업자 주도 + Rule:
+                # 작업자 답변은 조정 LLM으로 해석하되 target_shoulder_angle_deg는 무조건 무시한다.
+                # 실행에는 direction만 사용한다. up이면 +5cm, down이면 -5cm다.
+                # 답변이 비었거나 방향이 애매하면 같은 자리에서 다시 질문한다.
+                question_text = (
+                    "방금 작업 자세에서 부담이 감지됐습니다. 높이를 올릴까요, 내릴까요?"
+                    if is_risky_cycle
+                    else "현재 작업 자세는 위험하지 않았습니다. 그래도 높이를 조정할까요?"
+                )
+                while True:
+                    worker_voice = wait_for_worker_voice(question_text)
+                    question_text = worker_clarify_text
+                    if not worker_voice:
+                        continue
+
+                    intent = call_adjustment_llm(worker_text=worker_voice, is_system_review=False)
+                    if intent is None:
+                        continue
+
+                    # Cond4 Worker+Rule:
+                    # 의도해석기 출력 중 action과 direction만 사용한다.
+                    # amount_ratio와 target_shoulder_angle_deg는 이 조건에서 쓰지 않으므로 None 처리한다.
+                    condition_intent = {
+                        "action": intent.action,
+                        "direction": intent.direction,
+                        "amount_ratio": None,
+                        "target_shoulder_angle_deg": None,
+                        "confidence": intent.confidence,
+                        "reason": intent.reason,
+                    }
+
+                    if condition_intent["action"] == "keep":
+                        return keep_target()
+                    if condition_intent["action"] != "adjust":
+                        continue
+                    if condition_intent["direction"] == "up":
+                        return floor_target(current_target_floor_height_m + RULE_Z_STEP_M)
+                    if condition_intent["direction"] == "down":
+                        return floor_target(current_target_floor_height_m - RULE_Z_STEP_M)
+
+            case "Cond5_Control_NoInterv":
+                # 비개입 조건:
+                # 위험 사이클이어도 실험 조건상 아무 조정도 하지 않는다.
+                return keep_target()
+
+            case _:
+                # 알 수 없는 조건:
+                # 잘못된 condition이 들어와도 로봇을 움직이지 않는 쪽으로 둔다.
+                return keep_target()
+
+    print(f"[INITIAL GOAL READY] 목표 어깨각 {INITIAL_SHOULDER_ANGLE_DEG:.1f}도로 초기 위치를 계산합니다.")
+    initial_pose = pose_generator.generate_pose_from_shoulder_angle(INITIAL_SHOULDER_ANGLE_DEG, human_profile)
+    current_target_floor_height_m = initial_pose.target_floor_height_m
+
+    print("[START READY] 카메라 화면을 확인하고 S를 누르면 실험을 시작합니다. Q/ESC는 종료입니다.")
     started = False
     while cap.isOpened():
         ret, frame = cap.read()
@@ -655,15 +524,11 @@ def main():
             break
 
         posture_sample = posture_estimator.process_frame(frame)
-        shoulder_ang = posture_sample.shoulder_angle_deg if posture_sample.shoulder_angle_deg is not None else 0.0
-        elbow_ang = posture_sample.elbow_angle_deg if posture_sample.elbow_angle_deg is not None else 0.0
-        current_rula = posture_sample.rula_proxy if posture_sample.rula_proxy is not None else 1.0
+        posture_angle = posture_sample.shoulder_angle_deg if posture_sample.shoulder_angle_deg is not None else 0.0
 
         cv2.putText(frame, "Press S to start experiment", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
         cv2.putText(frame, "Q/ESC: Stop", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 200, 200), 2)
-        cv2.putText(frame, f"Shoulder Angle: {shoulder_ang:.1f} deg", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(frame, f"Elbow Angle: {elbow_ang:.1f} deg", (20, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.putText(frame, f"Live RULA: {current_rula:.1f}", (20, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(frame, f"Posture Angle: {posture_angle:.1f} deg", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
         cv2.imshow(DISPLAY_WINDOW_NAME, frame)
 
         start_key = cv2.waitKey(10) & 0xFF
@@ -691,21 +556,24 @@ def main():
     speak_and_wait("실험을 시작하겠습니다. 바른 자세로 로봇을 바라보고 앉아주세요.")
     SendPassGoal(initial_payload)
     SetReviewPending(False)
+
     experiment_start_time = time.time()
     key = -1
+    robot_state = "UNKNOWN"
+    previous_robot_state = None
+    next_robot_state_poll_time = 0.0
 
-    # 실시간 HRI 제어 루프는 상태 변화에 맞춰 필요한 객체만 호출한다.
     while cap.isOpened():
         elapsed_time = time.time() - experiment_start_time
         manual_stop_requested = key in (27, ord("q"), ord("Q"))
         if elapsed_time >= MAX_EXPERIMENT_TIME_SEC or manual_stop_requested:
             if manual_stop_requested:
-                print("[수동 조작 감지]: 실험 중단 키 입력")
+                print("[MANUAL STOP] Q/ESC input detected.")
                 speak("실험 중단 키가 입력되어 실험을 종료합니다.")
                 metrics.mark_early_stop()
             else:
-                print(f"[시간 종료] 8분({MAX_EXPERIMENT_TIME_SEC}초)이 경과되어 실험을 자동 종료합니다.")
-                speak("제한 시간 8분이 경과하여 실험을 종료합니다.")
+                print("[TIMEOUT] Experiment time limit reached.")
+                speak("제한 시간이 경과하여 실험을 종료합니다.")
             break
 
         current_voice = speech_recognizer.get_and_clear()
@@ -714,7 +582,6 @@ def main():
         if not ret:
             break
 
-        # HTTP bridge가 주는 최신 로봇 상태를 주기적으로 읽는다.
         now = time.time()
         if now >= next_robot_state_poll_time:
             fetched_robot_state = GetRobotState()
@@ -722,259 +589,127 @@ def main():
                 robot_state = fetched_robot_state
             next_robot_state_poll_time = now + ROBOT_STATE_POLL_SEC
 
-        # 자세 추정 파일이 한 프레임의 각도/RULA/visibility를 계산한다.
         posture_sample = posture_estimator.process_frame(frame)
-        shoulder_ang = posture_sample.shoulder_angle_deg if posture_sample.shoulder_angle_deg is not None else 0.0
-        elbow_ang = posture_sample.elbow_angle_deg if posture_sample.elbow_angle_deg is not None else 0.0
-        current_rula = posture_sample.rula_proxy if posture_sample.rula_proxy is not None else 1.0
+        entered_phase = robot_state != previous_robot_state
+        posture_angle = posture_sample.shoulder_angle_deg if posture_sample.shoulder_angle_deg is not None else 0.0
 
-        entered_at_task = robot_state == "AT_TASK" and previous_robot_state != "AT_TASK"
-        entered_returning = robot_state == "RETURNING" and previous_robot_state != "RETURNING"
-        entered_picking = robot_state == "PICKING" and previous_robot_state != "PICKING"
-        entered_idle = robot_state == "IDLE" and previous_robot_state != "IDLE"
+        match robot_state:
+            case "PICKING" | "IDLE" | "UNKNOWN":
+                # 준비/대기 상태:
+                # 이전 사이클에서 남은 리뷰 결과를 정리하고 review pending 상태를 꺼둔다.
+                if entered_phase:
+                    review_cycle_result = None
+                    SetReviewPending(False)
 
-        # PICKING에서는 이전 검토 상태를 정리하고 다음 AT_TASK를 기다린다.
-        if entered_picking:
-            awaiting_worker_answer = False
-            completion_sent = False
-            SetReviewPending(False)
+            case "AT_TASK":
+                # 작업 상태:
+                # 자세 샘플을 계속 누적하고, SPACE 또는 음성 완료 의도만 처리한다.
+                # 완료 의도가 들어오면 cycle 측정을 끝내 review_cycle_result에 저장한 뒤
+                # SendHoldFinished()로 로봇이 RETURNING으로 넘어가게 알린다.
+                # AT_TASK records posture samples and listens only for completion intent.
+                if entered_phase:
+                    speech_recognizer.get_and_clear()
+                    speak("블록의 네 개 볼트에 있는 너트를 드릴로 빼주세요.")
+                    metrics.start_cycle()
+                    review_cycle_result = None
+                    last_task_sample_time = 0.0
+                    key = -1
 
-        # AT_TASK 진입 시 새 cycle 자세 누적을 시작한다.
-        if entered_at_task:
-            speech_recognizer.get_and_clear()
-            if previous_robot_state != "AT_TASK":
-                speak("블록의 네 개 볼트에 있는 너트를 드릴로 빼주세요.")
-            metrics.start_cycle()
-            current_cycle_result = None
-            last_task_sample_time = 0.0
-            awaiting_worker_answer = False
-            completion_sent = False
-            key = -1
+                if review_cycle_result is None:
+                    sample_time = time.time()
+                    dt = max(0.0, sample_time - last_task_sample_time) if last_task_sample_time else 0.0
+                    last_task_sample_time = sample_time
+                    metrics.add_posture_sample(posture_sample, dt)
 
-        # AT_TASK 중에는 프레임 자세값과 dt만 metrics에 넘긴다.
-        if robot_state == "AT_TASK":
-            sample_time = time.time()
-            dt = max(0.0, sample_time - last_task_sample_time) if last_task_sample_time else 0.0
-            last_task_sample_time = sample_time
-            metrics.add_posture_sample(posture_sample, dt)
+                    intent = manual_task_completion_from_key(key)
+                    if intent is None and current_voice and intent_interpreter is not None:
+                        intent = intent_interpreter.interpret_task_completion(current_voice)
+                        metrics.record_llm_call(intent_interpreter.last_latency_s)
+                        save_llm_response_json(f"trial_{trial_count + 1:03d}_task_completion")
 
-        # 작업 완료 입력이 오면 hold_finished를 보내고 cycle 결과를 확정한다.
-        if robot_state == "AT_TASK" and not completion_sent:
-            is_done = is_task_completion_input(
-                key,
-                current_voice,
-                llm_parser=llm_intent_parser,
-                metadata={"condition": current_condition},
-            )
+                    if intent is not None and intent.action == ACTION_COMPLETE:
+                        print(f"[TASK COMPLETE] reason={intent.reason}")
+                        speak("작업 완료를 확인했습니다.")
+                        review_cycle_result = metrics.finish_cycle()
+                        SendHoldFinished()
 
-            if is_done:
-                if key == ord(" "):
-                    print("[수동 조작 감지]: 스페이스바(완료) 눌림")
-                elif current_voice:
-                    print(f"[작업 완료 음성 감지]: '{current_voice}'")
-                speak("조립 완료블록을 내려놓습니다.")
-                SendHoldFinished()
-                current_cycle_result = metrics.finish_cycle()
-                completion_sent = True
+            case "RETURNING":
+                # 리뷰 상태:
+                # 확정된 cycle_result를 조건별 target_info로 바꾸고,
+                # 그 target_info를 pose_generator와 SendPassGoal/CSV 기록으로 연결한다.
+                if review_cycle_result is not None:
+                    SetReviewPending(True)
+                    target_info = resolve_returning_pose_target(review_cycle_result)
+                    action = str(target_info.get("action", "keep"))
+                    target_type = str(target_info.get("target_type", "none"))
+                    previous_target_floor_height_m = current_target_floor_height_m
+                    trial_number = trial_count + 1
 
-        # RETURNING 진입 시 cycle 결과를 보고 자동 유지/보정/작업자 질문을 결정한다.
-        if entered_returning and completion_sent:
-            SetReviewPending(True)
-            user_response_text = ""
-            # policy = decide_returning_policy(current_condition, is_policy_risky_cycle(current_cycle_result))
-            policy = decide_returning_policy(current_condition, bool(current_cycle_result.is_risky_cycle))
-            speak(policy["message"])
-            if policy["mode"] == "ask_worker":
-                tts_speaker.wait_until_done()
-
-            if policy["mode"] == "auto":
-                if policy["is_risky"] and current_condition["lead"] == "System":
-                    metrics.record_system_intervention()
-
-                if (
-                    policy["should_adjust"]
-                    and current_condition["lead"] == "System"
-                    and current_condition["control"] == "LLM"
-                    and llm_intent_parser is not None
-                ):
-                    llm_start_time = time.time()
-                    llm_decision = llm_intent_parser.parse(
-                        "",
-                        context="system_adjustment",
-                        metadata=build_system_llm_metadata(),
-                    )
-                    llm_latency = time.time() - llm_start_time
-                    metrics.record_llm_call(llm_latency)
-
-                    print(
-                        f"[System+LLM 판단]: action={llm_decision.action}, "
-                        f"target_angle={llm_decision.target_shoulder_angle_deg}, "
-                        f"reason={llm_decision.reason}"
-                    )
-
-                    if (
-                        llm_decision.action in ("approve", "adjust")
-                        and llm_decision.target_shoulder_angle_deg is not None
-                    ):
-                        apply_next_target(
-                            "[System+LLM] automatic adjustment",
-                            True,
-                            target_shoulder_angle_deg=default_llm_safe_target_angle(),
-                            llm_latency=llm_latency,
-                            is_invalid=llm_decision.is_invalid,
-                            response_action=llm_decision.action,
-                            response_source=llm_decision.source,
-                            response_direction=llm_decision.direction,
-                            llm_confidence=llm_decision.confidence,
-                            decision_reason=llm_decision.reason,
+                    if action == "adjust" and target_type == "shoulder_angle":
+                        pose_result = pose_generator.generate_pose_from_shoulder_angle(
+                            target_info["target_shoulder_angle_deg"],
+                            human_profile,
+                        )
+                        next_target_floor_height_m, adjustment_m, robot_command_sent = send_pose_goal(
+                            pose_result,
+                            trial_number,
+                            previous_target_floor_height_m,
+                        )
+                    elif action == "adjust" and target_type == "floor_height":
+                        pose_result = pose_generator.generate_pose_from_floor_height(
+                            target_info["target_floor_height_m"],
+                            human_profile,
+                        )
+                        next_target_floor_height_m, adjustment_m, robot_command_sent = send_pose_goal(
+                            pose_result,
+                            trial_number,
+                            previous_target_floor_height_m,
                         )
                     else:
-                        apply_next_target(
-                            "[System+LLM fallback] safe-angle adjustment",
-                            policy["should_adjust"],
-                            target_shoulder_angle_deg=default_llm_safe_target_angle(),
-                            llm_latency=llm_latency,
-                            is_invalid=llm_decision.is_invalid,
-                            response_action=llm_decision.action,
-                            response_source="system_llm_fallback",
-                            response_direction="down",
-                            llm_confidence=llm_decision.confidence,
-                            decision_reason=llm_decision.reason,
-                            llm_fallback=True,
+                        pose_result = pose_generator.generate_pose_from_floor_height(
+                            current_target_floor_height_m,
+                            human_profile,
                         )
-                else:
-                    is_system_rule_adjustment = (
-                        policy["should_adjust"]
-                        and current_condition["lead"] == "System"
-                        and current_condition["control"] == "Rule"
+                        next_target_floor_height_m = current_target_floor_height_m
+                        adjustment_m = 0.0
+                        robot_command_sent = False
+
+                    write_target_trial_record(
+                        target_info=target_info,
+                        cycle=review_cycle_result,
+                        pose_result=pose_result,
+                        trial_number=trial_number,
+                        previous_target_floor_height_m=previous_target_floor_height_m,
+                        next_target_floor_height_m=next_target_floor_height_m,
+                        adjustment_m=adjustment_m,
+                        robot_command_sent=robot_command_sent,
                     )
-                    apply_next_target(
-                        user_response_text,
-                        policy["should_adjust"],
-                        target_shoulder_angle_deg=None,
-                        response_action="adjust" if policy["should_adjust"] else "maintain",
-                        response_source="system_rule" if is_system_rule_adjustment else "policy",
-                        response_direction="down" if is_system_rule_adjustment else "maintain",
-                    )
-            else:
-                speech_recognizer.get_and_clear()
-                wait_start_time = time.time()
-                awaiting_worker_answer = True
+                    current_target_floor_height_m = next_target_floor_height_m
+                    trial_count = trial_number
+                    review_cycle_result = None
+                    SetReviewPending(False)
 
-        # Worker 주도 조건에서는 RETURNING 중 작업자 답변을 받아 다음 target을 만든다.
-        if robot_state == "RETURNING" and awaiting_worker_answer:
-            worker_response = parse_worker_adjustment_input(
-                wait_start_time=wait_start_time,
-                key=key,
-                voice_text=current_voice,
-                control_type=current_condition["control"],
-                rule_parser=rule_intent_parser,
-                llm_parser=llm_intent_parser,
-                metadata=build_adjustment_metadata(),
-            )
-            elapsed_wait = worker_response["elapsed_wait"]
-            cv2.putText(
-                frame,
-                f"Waiting Answer... {elapsed_wait:.1f}s",
-                (20, 220),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 165, 255),
-                2,
-            )
+            case _:
+                # 그 외 상태:
+                # 아직 실험 판단에는 쓰지 않는 로봇 상태이므로 화면 표시만 유지한다.
+                # Other robot states only keep the display alive.
+                pass
 
-            if (
-                worker_response["action"] != "ignored"
-                and (current_voice or worker_response["source"] == "manual")
-            ):
-                print(
-                    f"[작업자 답변]: '{worker_response['text']}' -> "
-                    f"{worker_response['action']} ({worker_response['source']}) | "
-                    f"direction={worker_response['direction']} | "
-                    f"proposed_target={worker_response['target_shoulder_angle_deg']} | "
-                    f"confidence={worker_response['confidence']:.2f} | "
-                    f"reason={worker_response['reason']}"
-                )
+        phase_label = robot_state
 
-            if current_voice and worker_response["source"] in ("llm", "llm_error", "rule_llm"):
-                metrics.record_llm_call(worker_response["latency"])
-
-            if worker_response["action"] == "ask_clarification" and worker_response["clarification_question"]:
-                speak_and_wait(worker_response["clarification_question"])
-                speech_recognizer.get_and_clear()
-
-            if worker_response["action"] == "limit_reached":
-                speak_and_wait(
-                    "현재 로봇이 전달할 수 있는 최저 높이입니다. "
-                    "더 낮춰서 전달할 수 없습니다. 다시 말씀해 주세요."
-                )
-                speech_recognizer.get_and_clear()
-                print("[최저 높이 도달] 작업자 답변을 계속 기다립니다.")
-            elif worker_response["answered"]:
-                should_adjust = worker_response["action"] in ("approve", "adjust")
-                limit_message = (
-                    worker_target_limit_message(
-                        worker_response["direction"],
-                        worker_response["target_shoulder_angle_deg"],
-                    )
-                    if should_adjust
-                    else None
-                )
-                if limit_message:
-                    speak_and_wait(limit_message)
-                    speech_recognizer.get_and_clear()
-                    print("[로봇 높이 한계 도달] 작업자 답변을 계속 기다립니다.")
-                else:
-                    ack_message = worker_adjustment_ack_message(worker_response)
-                    if ack_message:
-                        speak_and_wait(ack_message)
-                    apply_next_target(
-                        worker_response["text"],
-                        should_adjust,
-                        target_shoulder_angle_deg=worker_response["target_shoulder_angle_deg"],
-                        llm_latency=worker_response["latency"],
-                        is_invalid=worker_response["is_invalid"],
-                        response_action=worker_response["action"],
-                        response_source=worker_response["source"],
-                        response_direction=worker_response["direction"],
-                        llm_confidence=worker_response["confidence"],
-                        decision_reason=worker_response["reason"],
-                    )
-            elif current_voice and worker_response["action"] not in ("ask_clarification", "ignored"):
-                if worker_response["is_invalid"]:
-                    metrics.record_invalid_command()
-                speak_and_wait("잘 인식하지 못했습니다. 다시 말씀해 주세요.")
-                speech_recognizer.get_and_clear()
-                print("[작업자 답변 해석 실패] 다시 답변을 기다립니다.")
-
-        # IDLE에서는 한 cycle 흐름을 마치고 대기 상태로 정리한다.
-        if entered_idle:
-            awaiting_worker_answer = False
-            completion_sent = False
-
-        if robot_state == "AT_TASK":
-            hri_phase_label = "AT_TASK_MEASURING"
-        elif robot_state == "RETURNING" and awaiting_worker_answer:
-            hri_phase_label = "RETURNING_WAIT_ANSWER"
-        elif robot_state == "RETURNING":
-            hri_phase_label = "RETURNING_REVIEW"
-        else:
-            hri_phase_label = robot_state
-
-        cv2.putText(frame, f"HRI State: {hri_phase_label}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"HRI State: {phase_label}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, f"Robot State: {robot_state}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 220, 0), 2)
         cv2.putText(frame, f"Trial: {trial_count}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-        cv2.putText(frame, f"Live RULA: {current_rula:.1f}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        cv2.putText(frame, f"Shoulder Angle: {shoulder_ang:.1f} deg", (20, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, f"Posture Angle: {posture_angle:.1f} deg", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
         current_elapsed_sec = time.time() - experiment_start_time
         elapsed_mins = int(current_elapsed_sec // 60)
         elapsed_secs = int(current_elapsed_sec % 60)
         timer_text = f"Time: {elapsed_mins:02d}:{elapsed_secs:02d} / 08:00"
-        cv2.putText(frame, timer_text, (20, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, timer_text, (20, 165), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(
             frame,
-            "[Manual Override] SPACE: Done | Y: Yes | N: No | Q/ESC: Stop",
+            "[Manual Override] SPACE: Done | Q/ESC: Stop",
             (20, 450),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -986,7 +721,6 @@ def main():
         key = cv2.waitKey(10) & 0xFF
         previous_robot_state = robot_state
 
-    # 종료 시 장치 정리 후 summary 한 줄을 저장한다.
     speech_recognizer.stop()
     posture_estimator.close()
     cap.release()
@@ -994,7 +728,7 @@ def main():
 
     actual_experiment_duration = time.time() - experiment_start_time if experiment_start_time else 0.0
     print("\n" + "=" * 60)
-    print(f"📊 [{current_condition['name']}] 매트릭스 추출 완료 (실제 진행 시간: {actual_experiment_duration:.1f}초)")
+    print(f"[SUMMARY] {current_condition['name']} complete ({actual_experiment_duration:.1f}s)")
     print("=" * 60)
 
     summary_record = metrics.build_summary(
@@ -1005,7 +739,7 @@ def main():
         shoulder_height_cm=user_shoulder_height_cm,
         upper_arm_cm=l1_cm,
         forearm_cm=l2_cm,
-        drill_tcp_offset_cm=DRILL_TCP_OFFSET_CM,
+        drill_tcp_offset_cm=DRILL_TCP_OFFSET_M * 100.0,
     )
     data_logger.write_summary(summary_record)
 
@@ -1015,3 +749,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
